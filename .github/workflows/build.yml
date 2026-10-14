@@ -35,9 +35,31 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
           cp app/build/outputs/apk/debug/app-debug.apk RecentsShield.apk
-          gh release delete latest --yes --cleanup-tag || true
+          REPO="$GITHUB_REPOSITORY"
+
+          # Remove the previous "latest" release, including any that got stuck as a draft.
+          for id in $(gh api "repos/$REPO/releases?per_page=100" --jq '.[] | select(.tag_name == "latest" or .draft) | .id'); do
+            gh api -X DELETE "repos/$REPO/releases/$id" || true
+          done
+          gh api -X DELETE "repos/$REPO/git/refs/tags/latest" || true
+          sleep 3
+
           gh release create latest RecentsShield.apk \
             --title "Latest build" \
             --notes "Built from ${GITHUB_SHA::7}. On your phone, tap RecentsShield.apk below to download and install." \
             --target "$GITHUB_SHA"
+
+          # GitHub occasionally leaves the new release as a draft; make sure it's published.
+          ID=$(gh api "repos/$REPO/releases?per_page=100" --jq '[.[] | select(.tag_name == "latest")][0].id')
+          gh api -X PATCH "repos/$REPO/releases/$ID" -F draft=false -f tag_name=latest -f target_commitish="$GITHUB_SHA" > /dev/null
+
+          # Check the phone download link actually works.
+          for i in 1 2 3 4 5; do
+            if curl -fsSL -o /dev/null "https://github.com/$REPO/releases/download/latest/RecentsShield.apk"; then
+              echo "Download link OK"; exit 0
+            fi
+            sleep 5
+          done
+          echo "Download link still not working"; exit 1
