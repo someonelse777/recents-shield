@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Recents Shield</string>
+    <string name="service_description">Covers the Recents previews of the apps you choose with a black box. It only looks at the Recents screen and the Recents button, and it never sends anything off your phone.</string>
+</resources>
