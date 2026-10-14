@@ -5,9 +5,12 @@ Blacks out the Recents (Overview) previews of the apps you choose, on Samsung On
 
 ## How it works
 
-- When you tap the Recents button, the whole screen is covered in black immediately.
-- As soon as the Recents screen can be read, the black shrinks to boxes over just the
-  cards of the apps you picked, and the boxes follow the cards as you scroll.
+- When Recents opens, the app finds each card's preview (`task_scene` on One UI) and
+  draws a black box over the previews of the apps you picked.
+- Every display frame it re-reads where those previews are, and nudges the boxes ahead
+  by the scroll speed so they keep up while you swipe.
+- App badges, and cards stacked in front of a hidden card, are cut out of the black so
+  they stay visible.
 - When you open an app or leave Recents, the overlay disappears.
 
 The boxes are see-through to touches, so tapping a blacked-out card still opens that app.
