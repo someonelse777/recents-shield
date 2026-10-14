@@ -5,45 +5,39 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
-import android.graphics.drawable.Drawable
+import android.graphics.Typeface
 import android.os.Bundle
 import android.provider.Settings
-import android.text.Editable
-import android.text.TextWatcher
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
-import android.widget.BaseAdapter
 import android.widget.Button
-import android.widget.CheckBox
-import android.widget.EditText
-import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ListView
+import android.widget.ScrollView
+import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
 
 class MainActivity : Activity() {
 
-    private data class AppEntry(val pkg: String, val label: String, val icon: Drawable)
+    companion object {
+        private const val REQ_ALWAYS = 1
+    }
 
     private lateinit var status: TextView
     private lateinit var summary: TextView
-    private lateinit var search: EditText
-    private val adapter = AppAdapter()
-    private var allApps: List<AppEntry> = emptyList()
-    private var shown: List<AppEntry> = emptyList()
-    private val hidden = mutableSetOf<String>()
+    private lateinit var hiddenNow: TextView
+    private lateinit var alwaysText: TextView
+    private lateinit var scheduleList: LinearLayout
 
     private fun px(dp: Int) = (dp * resources.displayMetrics.density).toInt()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        hidden.addAll(Prefs.hidden(this))
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(px(16), px(12), px(16), 0)
+            setPadding(px(16), px(12), px(16), px(24))
         }
 
         status = TextView(this).apply { textSize = 16f }
@@ -53,49 +47,69 @@ class MainActivity : Activity() {
         buttons.addView(Button(this).apply {
             text = "Accessibility settings"
             setOnClickListener { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, weight())
         buttons.addView(Button(this).apply {
             text = "Copy diagnostics"
             setOnClickListener { copyDiagnostics() }
-        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, weight())
         root.addView(buttons)
 
         summary = TextView(this).apply {
             textSize = 13f
             alpha = 0.75f
-            setPadding(0, px(4), 0, px(8))
+            setPadding(0, px(4), 0, px(4))
         }
         root.addView(summary)
 
+        hiddenNow = TextView(this).apply {
+            textSize = 15f
+            setPadding(0, px(8), 0, 0)
+        }
+        root.addView(hiddenNow)
+
+        // Always hidden
+        root.addView(sectionTitle("Always hidden"))
+        val alwaysRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        alwaysText = TextView(this).apply { textSize = 15f }
+        alwaysRow.addView(alwaysText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        alwaysRow.addView(Button(this).apply {
+            text = "Choose"
+            setOnClickListener {
+                @Suppress("DEPRECATION")
+                startActivityForResult(
+                    AppPickerActivity.intent(this@MainActivity, "Always hidden", Prefs.hidden(this@MainActivity)),
+                    REQ_ALWAYS,
+                )
+            }
+        })
+        root.addView(alwaysRow)
+
+        // Schedules
+        root.addView(sectionTitle("Schedules"))
         root.addView(TextView(this).apply {
-            text = "Tick the apps whose Recents preview should be blacked out:"
-            textSize = 14f
-            setPadding(0, px(4), 0, px(4))
+            text = "Hide apps only on certain days and hours."
+            textSize = 13f
+            alpha = 0.75f
+        })
+        scheduleList = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(scheduleList)
+        root.addView(Button(this).apply {
+            text = "+ Add schedule"
+            setOnClickListener { startActivity(ScheduleActivity.intent(this@MainActivity, null)) }
         })
 
-        search = EditText(this).apply {
-            hint = "Search apps"
-            isSingleLine = true
-            addTextChangedListener(object : TextWatcher {
-                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
-                override fun afterTextChanged(s: Editable?) = applyFilter()
-            })
-        }
-        root.addView(search)
-
-        val list = ListView(this).apply {
-            adapter = this@MainActivity.adapter
-            setOnItemClickListener { _, _, pos, _ -> toggle(shown[pos].pkg) }
-        }
-        root.addView(list, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
-
-        setContentView(root)
-        loadApps()
+        setContentView(ScrollView(this).apply { addView(root) })
     }
 
     override fun onResume() {
         super.onResume()
+        refresh()
+    }
+
+    private fun refresh() {
         status.text = if (isServiceOn()) {
             "✅ Recents Shield is ON"
         } else {
@@ -103,6 +117,77 @@ class MainActivity : Activity() {
         }
         summary.text = Prefs.summary(this)
             ?: "After turning it on, open Recents once. A short check result will appear here."
+
+        val always = Prefs.hidden(this)
+        alwaysText.text = if (always.isEmpty()) "None" else appNames(this, always)
+
+        val schedules = Schedules.load(this)
+        val now = Schedules.activePackages(always, schedules)
+        hiddenNow.text = if (now.isEmpty()) "Hidden right now: nothing" else "Hidden right now: ${appNames(this, now, 5)}"
+
+        scheduleList.removeAllViews()
+        if (schedules.isEmpty()) {
+            scheduleList.addView(TextView(this).apply {
+                text = "No schedules yet."
+                textSize = 14f
+                setPadding(0, px(8), 0, px(4))
+            })
+        }
+        for (s in schedules) scheduleList.addView(scheduleRow(s))
+    }
+
+    private fun scheduleRow(s: Schedule): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, px(10), 0, px(10))
+            isClickable = true
+            setOnClickListener { startActivity(ScheduleActivity.intent(this@MainActivity, s.id)) }
+        }
+        val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val activeNow = s.isActive(java.util.Calendar.getInstance())
+        texts.addView(TextView(this).apply {
+            text = (s.name.ifBlank { "Schedule" }) + if (activeNow) "  • active now" else ""
+            textSize = 16f
+            setTypeface(typeface, Typeface.BOLD)
+        })
+        texts.addView(TextView(this).apply {
+            text = "${Schedules.daysText(s.days)} · ${Schedules.rangeText(this@MainActivity, s)}"
+            textSize = 14f
+        })
+        texts.addView(TextView(this).apply {
+            text = if (s.apps.isEmpty()) "No apps" else appNames(this@MainActivity, s.apps)
+            textSize = 13f
+            alpha = 0.75f
+        })
+        row.addView(texts, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        row.addView(Switch(this).apply {
+            isChecked = s.enabled
+            setOnCheckedChangeListener { _, on ->
+                Schedules.upsert(this@MainActivity, s.copy(enabled = on))
+                refresh()
+            }
+        })
+        return row
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        @Suppress("DEPRECATION")
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode == REQ_ALWAYS && resultCode == RESULT_OK) {
+            AppPickerActivity.result(data)?.let { Prefs.setHidden(this, it) }
+            refresh()
+        }
+    }
+
+    private fun weight() = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+
+    private fun sectionTitle(t: String) = TextView(this).apply {
+        text = t
+        textSize = 18f
+        setTypeface(typeface, Typeface.BOLD)
+        setPadding(0, px(20), 0, px(4))
     }
 
     private fun isServiceOn(): Boolean {
@@ -111,35 +196,6 @@ class MainActivity : Activity() {
         return enabled.split(':').any {
             it.equals(me.flattenToString(), true) || it.equals(me.flattenToShortString(), true)
         }
-    }
-
-    private fun loadApps() {
-        Thread {
-            val pm = packageManager
-            val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-            val apps = pm.queryIntentActivities(intent, 0)
-                .distinctBy { it.activityInfo.packageName }
-                .filter { it.activityInfo.packageName != packageName }
-                .map { AppEntry(it.activityInfo.packageName, it.loadLabel(pm).toString(), it.loadIcon(pm)) }
-            runOnUiThread {
-                allApps = apps
-                applyFilter()
-            }
-        }.start()
-    }
-
-    private fun applyFilter() {
-        val q = search.text?.toString()?.trim()?.lowercase() ?: ""
-        shown = allApps
-            .filter { q.isEmpty() || q in it.label.lowercase() || q in it.pkg.lowercase() }
-            .sortedWith(compareBy<AppEntry>({ it.pkg !in hidden }, { it.label.lowercase() }))
-        adapter.notifyDataSetChanged()
-    }
-
-    private fun toggle(pkg: String) {
-        if (!hidden.remove(pkg)) hidden.add(pkg)
-        Prefs.setHidden(this, hidden)
-        adapter.notifyDataSetChanged()
     }
 
     private fun copyDiagnostics() {
@@ -151,33 +207,5 @@ class MainActivity : Activity() {
         val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
         cm.setPrimaryClip(ClipData.newPlainText("Recents Shield diagnostics", f.readText()))
         Toast.makeText(this, "Copied. Paste it to Claude.", Toast.LENGTH_SHORT).show()
-    }
-
-    private inner class AppAdapter : BaseAdapter() {
-        override fun getCount() = shown.size
-        override fun getItem(position: Int) = shown[position]
-        override fun getItemId(position: Int) = position.toLong()
-
-        override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View {
-            val row = (convertView as? LinearLayout) ?: LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, px(8), 0, px(8))
-                addView(ImageView(context), LinearLayout.LayoutParams(px(40), px(40)))
-                addView(TextView(context).apply {
-                    textSize = 16f
-                    setPadding(px(12), 0, px(8), 0)
-                }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-                addView(CheckBox(context).apply {
-                    isClickable = false
-                    isFocusable = false
-                })
-            }
-            val app = shown[position]
-            (row.getChildAt(0) as ImageView).setImageDrawable(app.icon)
-            (row.getChildAt(1) as TextView).text = app.label
-            (row.getChildAt(2) as CheckBox).isChecked = app.pkg in hidden
-            return row
-        }
     }
 }

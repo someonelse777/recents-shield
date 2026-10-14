@@ -8,14 +8,17 @@ data class HiddenApp(val pkg: String, val labels: List<String>)
 
 /**
  * One card on the Recents screen.
- *  - [scene] is the preview image itself (Samsung: id/task_scene). Its live bounds are
- *    re-read every frame while Recents is open.
- *  - [icon] is the app badge that sits on the card's top edge (Samsung: id/task_icon).
+ *  - [node] is the whole card (Samsung: id/taskView, desc = app name). Its live bounds and
+ *    name are re-read every frame while Recents is open, because the list recycles card
+ *    views as you scroll (a view can switch to a different app).
+ *  - The preview starts [sceneTopRatio] of the card's height below the card's top
+ *    (the strip above it is where the badge sits).
+ *  - [icon] is the app badge on the card's top edge (Samsung: id/task_icon).
  */
 class Card(
-    val scene: AccessibilityNodeInfo,
+    val node: AccessibilityNodeInfo,
+    val sceneTopRatio: Float,
     val icon: AccessibilityNodeInfo?,
-    val hidden: Boolean,
     val label: String,
     val drawingOrder: Int,
 )
@@ -52,14 +55,14 @@ object RecentsScanner {
 
         val cardNodes = nodes.filter { shortId(it) in CARD_IDS }
         val cards = if (cardNodes.isNotEmpty()) {
-            cardNodes.mapNotNull { cardFrom(it, hidden) }
+            cardNodes.map { cardFrom(it) }
         } else {
             genericCards(nodes, hidden, screen)
         }
         return Result(true, cards)
     }
 
-    private fun cardFrom(card: AccessibilityNodeInfo, hidden: List<HiddenApp>): Card? {
+    private fun cardFrom(card: AccessibilityNodeInfo): Card {
         var scene: AccessibilityNodeInfo? = null
         var icon: AccessibilityNodeInfo? = null
         for (i in 0 until card.childCount) {
@@ -69,10 +72,19 @@ object RecentsScanner {
                 in ICON_IDS -> if (icon == null) icon = c
             }
         }
-        val label = (card.contentDescription ?: card.text)?.toString()?.trim() ?: ""
-        val isHidden = hidden.any { app -> app.labels.any { labelMatches(label, it) } }
-        return Card(scene ?: card, icon, isHidden, label, card.drawingOrder)
+        var ratio = 0f
+        if (scene != null) {
+            val cb = Rect().also { card.getBoundsInScreen(it) }
+            val sb = Rect().also { scene.getBoundsInScreen(it) }
+            if (cb.height() > 0) ratio = ((sb.top - cb.top).toFloat() / cb.height()).coerceIn(0f, 0.3f)
+        }
+        return Card(card, ratio, icon, labelOf(card), card.drawingOrder)
     }
+
+    fun labelOf(n: AccessibilityNodeInfo): String = (n.contentDescription ?: n.text)?.toString()?.trim() ?: ""
+
+    fun isHidden(label: String, hidden: List<HiddenApp>): Boolean =
+        label.isNotEmpty() && hidden.any { app -> app.labels.any { labelMatches(label, it) } }
 
     /** Fallback for layouts without known ids: walk up from a matching label to a card-sized view. */
     private fun genericCards(nodes: List<AccessibilityNodeInfo>, hidden: List<HiddenApp>, screen: Rect): List<Card> {
@@ -87,7 +99,7 @@ object RecentsScanner {
                 val found: AccessibilityNodeInfo = cur
                 found.getBoundsInScreen(b)
                 if (b.height() >= screen.height() * 0.2f && b.width() <= screen.width() * 0.9f) {
-                    out.getOrPut(found) { Card(found, null, true, app.labels.first(), found.drawingOrder) }
+                    out.getOrPut(found) { Card(found, 0f, null, app.labels.first(), found.drawingOrder) }
                     break
                 }
                 cur = try { cur.parent } catch (_: Exception) { null }
