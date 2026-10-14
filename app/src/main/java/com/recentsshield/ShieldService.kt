@@ -78,6 +78,7 @@ class ShieldService : AccessibilityService() {
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         homePackages = findHomePackages()
         loadSettings()
+        Diag.log(this, "Service started")
     }
 
     // ---------------------------------------------------------------- what to hide
@@ -121,6 +122,10 @@ class ShieldService : AccessibilityService() {
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         if (!::overlay.isInitialized) return
+        guarded("event") { handleEvent(e) }
+    }
+
+    private fun handleEvent(e: AccessibilityEvent) {
         val pkg = e.packageName?.toString() ?: return
         val now = SystemClock.uptimeMillis()
 
@@ -202,21 +207,24 @@ class ShieldService : AccessibilityService() {
 
     private fun requestScan() {
         if (!scanQueued.compareAndSet(false, true)) return
-        scanHandler.post {
+        val posted = scanHandler.post {
             scanQueued.set(false)
-            val root = findHomeRoot()
-            val result = if (root != null) {
-                try { RecentsScanner.scan(root, hiddenNow()) } catch (_: Exception) { null }
-            } else null
-            main.post { applyScan(result) }
+            val result = try {
+                findHomeRoot()?.let { RecentsScanner.scan(it, hiddenNow()) }
+            } catch (t: Throwable) {
+                logError("scan", t)
+                null
+            }
+            main.post { guarded("applyScan") { applyScan(result) } }
         }
+        if (!posted) scanQueued.set(false)
     }
 
     private val periodicScan = object : Runnable {
         override fun run() {
             val now = SystemClock.uptimeMillis()
             if (!active && now >= armedUntil) return
-            requestScan()
+            guarded("periodic") { requestScan() }
             scanHandler.postDelayed(this, if (now < armedUntil) FAST_SCAN_MS else PERIODIC_SCAN_MS)
         }
     }
@@ -257,7 +265,7 @@ class ShieldService : AccessibilityService() {
     private val frame = object : Choreographer.FrameCallback {
         override fun doFrame(frameTimeNanos: Long) {
             if (!active) return
-            trackAndDraw()
+            guarded("frame") { trackAndDraw() }
             Choreographer.getInstance().postFrameCallback(this)
         }
     }
@@ -397,12 +405,29 @@ class ShieldService : AccessibilityService() {
                 append('\n')
             }
             Prefs.dumpFile(this).writeText(header + RecentsScanner.dump(root))
-        } catch (_: Exception) {}
+        } catch (t: Throwable) {
+            logError("diagnostics", t)
+        }
+    }
+
+    /** Run [block]; log instead of crashing (a crash stops the shield until the app is reopened). */
+    private inline fun guarded(where: String, block: () -> Unit) {
+        try { block() } catch (t: Throwable) { logError(where, t) }
+    }
+
+    private var lastErrorLog = 0L
+
+    private fun logError(where: String, t: Throwable) {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastErrorLog < 5_000) return // don't flood the log from a per-frame error
+        lastErrorLog = now
+        Diag.log(this, "Error in $where", t)
     }
 
     override fun onInterrupt() {}
 
     override fun onUnbind(intent: Intent?): Boolean {
+        Diag.log(this, "Service stopped (turned off, or Android unbound it)")
         cleanup()
         return super.onUnbind(intent)
     }

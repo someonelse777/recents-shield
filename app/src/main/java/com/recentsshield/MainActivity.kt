@@ -6,7 +6,9 @@ import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Typeface
+import android.net.Uri
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.View
@@ -25,6 +27,7 @@ class MainActivity : Activity() {
     }
 
     private lateinit var status: TextView
+    private lateinit var batteryRow: LinearLayout
     private lateinit var summary: TextView
     private lateinit var hiddenNow: TextView
     private lateinit var alwaysText: TextView
@@ -53,6 +56,22 @@ class MainActivity : Activity() {
             setOnClickListener { copyDiagnostics() }
         }, weight())
         root.addView(buttons)
+
+        // Battery warning (only shown when the app can be put to sleep)
+        batteryRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, px(8), 0, px(4))
+        }
+        batteryRow.addView(TextView(this).apply {
+            text = "⚠️ Battery optimization is on, so Samsung may put Recents Shield to sleep and the " +
+                "shield will stop working until you reopen this app."
+            textSize = 14f
+        })
+        batteryRow.addView(Button(this).apply {
+            text = "Let it run in the background"
+            setOnClickListener { requestBatteryExemption() }
+        })
+        root.addView(batteryRow)
 
         summary = TextView(this).apply {
             textSize = 13f
@@ -115,6 +134,7 @@ class MainActivity : Activity() {
         } else {
             "⚠️ Recents Shield is OFF. Tap Accessibility settings → Installed apps → Recents Shield → turn it on."
         }
+        batteryRow.visibility = if (isBatteryOptimized()) View.VISIBLE else View.GONE
         summary.text = Prefs.summary(this)
             ?: "After turning it on, open Recents once. A short check result will appear here."
 
@@ -198,14 +218,35 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun isBatteryOptimized(): Boolean {
+        val pm = getSystemService(POWER_SERVICE) as PowerManager
+        return !pm.isIgnoringBatteryOptimizations(packageName)
+    }
+
+    private fun requestBatteryExemption() {
+        try {
+            @Suppress("BatteryLife")
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (_: Exception) {
+            // Fall back to this app's settings page (Battery → Unrestricted).
+            startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }
+    }
+
     private fun copyDiagnostics() {
         val f = Prefs.dumpFile(this)
-        if (!f.exists()) {
-            Toast.makeText(this, "Nothing yet. Open Recents once with the service on.", Toast.LENGTH_LONG).show()
-            return
+        val dump = if (f.exists()) f.readText() else "(No Recents snapshot yet. Open Recents once with the service on.)"
+        val text = buildString {
+            append("Service on: ${isServiceOn()}, battery optimized: ${isBatteryOptimized()}\n\n")
+            append("=== Event log ===\n")
+            append(Diag.read(this@MainActivity).takeLast(12_000).ifEmpty { "(empty)\n" })
+            append("\n=== Last Recents snapshot ===\n")
+            append(dump)
         }
         val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
-        cm.setPrimaryClip(ClipData.newPlainText("Recents Shield diagnostics", f.readText()))
+        cm.setPrimaryClip(ClipData.newPlainText("Recents Shield diagnostics", text))
         Toast.makeText(this, "Copied. Paste it to Claude.", Toast.LENGTH_SHORT).show()
     }
 }

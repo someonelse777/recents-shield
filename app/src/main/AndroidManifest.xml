@@ -13,7 +13,11 @@
         </intent>
     </queries>
 
+    <!-- Lets the app ask to be excluded from battery optimization, so Samsung doesn't put it to sleep. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <application
+        android:name=".ShieldApp"
         android:allowBackup="false"
         android:icon="@drawable/ic_shield"
         android:label="@string/app_name"

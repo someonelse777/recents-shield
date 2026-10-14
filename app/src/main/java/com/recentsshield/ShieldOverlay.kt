@@ -28,7 +28,12 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
 
     private var view: ShieldView? = null
 
-    fun show(shields: List<Shield>) = attach().setShields(shields)
+    fun show(shields: List<Shield>) {
+        // Nothing to draw and nothing showing: don't create a window at all.
+        if (shields.isEmpty() && view == null) return
+        val v = attach() ?: return
+        v.setShields(shields)
+    }
 
     fun hide() {
         val v = view ?: return
@@ -36,7 +41,9 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
         try { wm.removeViewImmediate(v) } catch (_: Exception) {}
     }
 
-    private fun attach(): ShieldView {
+    private var lastFailure = 0L
+
+    private fun attach(): ShieldView? {
         view?.let { return it }
         val v = ShieldView(ctx)
         val lp = WindowManager.LayoutParams(
@@ -56,9 +63,18 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             lp.fitInsetsTypes = 0
         }
-        wm.addView(v, lp)
-        view = v
-        return v
+        return try {
+            wm.addView(v, lp)
+            view = v
+            v
+        } catch (e: Exception) {
+            // Android can briefly refuse the overlay (e.g. while the service reconnects).
+            // That used to crash the service; now we skip this frame and try again.
+            val now = android.os.SystemClock.uptimeMillis()
+            if (now - lastFailure > 10_000) Diag.log(ctx, "Overlay couldn't be shown: ${e.javaClass.simpleName}: ${e.message}")
+            lastFailure = now
+            null
+        }
     }
 }
 
