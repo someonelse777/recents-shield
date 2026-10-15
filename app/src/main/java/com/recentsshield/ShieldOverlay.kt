@@ -138,9 +138,20 @@ private class ShieldView(ctx: Context, private val debugOutline: Boolean) : View
         invalidate()
     }
 
+    private val blinkPaint = Paint().apply { style = Paint.Style.FILL }
+    private val debugMargin = 14f * ctx.resources.displayMetrics.density
+
     override fun onDraw(canvas: Canvas) {
         draws++
-        if (debugOutline) canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), debugPaint)
+        if (debugOutline) {
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), debugPaint)
+            // Blinks red/green twice a second: if it keeps blinking, this window is updating.
+            val phase = (android.os.SystemClock.uptimeMillis() / 500) % 2 == 0L
+            blinkPaint.color = if (phase) Color.RED else Color.GREEN
+            val sq = 36f * resources.displayMetrics.density
+            canvas.drawRect(sq * 0.6f, sq * 2.5f, sq * 1.6f, sq * 3.5f, blinkPaint)
+            postInvalidateOnAnimation() // keep blinking even with nothing else changing
+        }
         if (shields.isEmpty()) return
         paintedBoxes += shields.size
         getLocationOnScreen(loc)
@@ -153,6 +164,7 @@ private class ShieldView(ctx: Context, private val debugOutline: Boolean) : View
         for (s in shields) {
             boxPath.reset()
             toRectF(s.box, ox, oy, left, right, cardRadius)
+            if (debugOutline) rf.inset(-debugMargin, -debugMargin)
             boxPath.addRoundRect(rf, cardRadius, cardRadius, Path.Direction.CW)
             for (i in s.cutouts.indices) {
                 val r = s.cutouts[i]
