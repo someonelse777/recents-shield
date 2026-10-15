@@ -17,28 +17,28 @@ import android.view.accessibility.AccessibilityWindowInfo
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
-import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.abs
 import kotlin.math.hypot
 
 /**
- * How it works:
- *  - Tapping the Recents button (or any change on the Recents screen) triggers a scan of
- *    the home app's accessibility tree on a background thread. A scan lists every card.
- *  - While Recents is open, every display frame we re-read just the cards' live positions
- *    and names (cheap), and redraw the black boxes, nudged ahead by the scroll speed so
- *    they don't trail behind. Full rescans keep running in the background to pick up
- *    cards scrolling into view.
- *  - Cards stacked in front of a hidden card, and badges, are cut out of the black.
- *  - Which apps are hidden = the "Always" list plus any schedule active right now.
- *  - When an app opens, Home/Back is pressed, or Recents goes away, the overlay is removed.
+ * Two threads, so drawing can never be held up:
+ *
+ *  WORKER thread: everything that asks another app something (window list, Recents cards,
+ *  card positions). Those questions can wait up to several seconds when the other app is
+ *  busy animating, which is exactly when Recents opens. The worker:
+ *    - decides on/off from what's on screen: an app in front -> off; Recents showing with
+ *      cards -> on. Events (button taps, window changes) only tell it to look closely.
+ *    - while on, re-reads card positions ~30 times a second (a full rescan every 250 ms)
+ *      and publishes the boxes plus how fast each card is moving.
+ *
+ *  MAIN thread: only draws. Every display frame it takes the latest published boxes and
+ *  moves them ahead by each card's speed, so they keep up with scrolling. It never waits
+ *  on another app.
  */
 class ShieldService : AccessibilityService() {
 
     private val main = Handler(Looper.getMainLooper())
-    private val scanThread = HandlerThread("recents-scan").apply { start() }
-    private val scanHandler = Handler(scanThread.looper)
-    private val scanQueued = AtomicBoolean(false)
+    private val workerThread = HandlerThread("recents-shield-worker").apply { start() }
+    private val worker = Handler(workerThread.looper)
 
     private lateinit var overlay: ShieldOverlay
     private lateinit var prefs: SharedPreferences
@@ -53,21 +53,32 @@ class ShieldService : AccessibilityService() {
     @Volatile private var activeHidden: List<HiddenApp> = emptyList()
     @Volatile private var activeMinute = -1L
 
-    // State shared with the scan thread
+    // ---- worker-thread state (only touched on the worker, except reads of `active`)
     @Volatile private var active = false
-    @Volatile private var armedUntil = 0L    // after a Recents tap, keep trying while Recents opens
-
-    // Main-thread state
+    private var armedUntil = 0L
     private var misses = 0
-    private var lastIdleScan = 0L
-    private var lastActiveScanRequest = 0L
     private var cards: List<Card> = emptyList()
+    private var lastFullScan = 0L
+    private var tickScheduled = false
     private val motion = HashMap<AccessibilityNodeInfo, Motion>()
+    private var ticks = 0
+    private var ticksWithBoxes = 0
+    private var failedReads = 0
+    private var lastDiag = 0L
 
     private class Motion(var x: Float, var t: Long, var vx: Float)
 
+    /** Boxes published by the worker for the main thread to draw. [vx] is px/ms per shield. */
+    private class Snapshot(val shields: List<Shield>, val vx: FloatArray, val time: Long)
+
+    @Volatile private var snapshot: Snapshot? = null
+
+    // ---- main-thread state
+    private var drawing = false
+    private var lastHomeEvent = 0L
+
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-        if (key == Prefs.KEY_HIDDEN || key == Schedules.KEY) loadSettings()
+        if (key == Prefs.KEY_HIDDEN || key == Schedules.KEY) worker.post { loadSettings() }
     }
 
     override fun onServiceConnected() {
@@ -117,7 +128,7 @@ class ShieldService : AccessibilityService() {
         return activeHidden
     }
 
-    // ---------------------------------------------------------------- events
+    // ---------------------------------------------------------------- events (main thread, no waiting)
 
     override fun onAccessibilityEvent(e: AccessibilityEvent) {
         if (!::overlay.isInitialized) return
@@ -125,221 +136,153 @@ class ShieldService : AccessibilityService() {
     }
 
     private fun handleEvent(e: AccessibilityEvent) {
+        // Only cheap fields of the event are read here. Nothing that asks another app.
         val pkg = e.packageName?.toString() ?: return
+        val type = e.eventType
         val now = SystemClock.uptimeMillis()
 
-        // Events only tell us *when* to look. What's actually on screen (checked by a scan)
-        // decides whether the shield is on: signals can arrive late or out of order.
-
-        if (e.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED && pkg == SYSTEM_UI) {
-            val button = navButton(e) ?: return
-            if (button == NavButton.RECENTS) scanHandler.postDelayed({ writeDiagnostics() }, DIAG_DELAY_MS)
-            if (hiddenNow().isNotEmpty() || active) lookCloselyFor(now)
+        if (type == AccessibilityEvent.TYPE_VIEW_CLICKED && pkg == SYSTEM_UI) {
+            // A navigation button (or something else in System UI) was tapped: look closely.
+            worker.post { guarded("arm") { arm(); scheduleDiagnostics() } }
             return
         }
-
         if (pkg in homePackages) {
-            if (active) {
-                if (now - lastActiveScanRequest > ACTIVE_EVENT_SCAN_MS) {
-                    lastActiveScanRequest = now
-                    requestScan()
+            // While on: refresh the card list soon. While off: one quick check (in case Recents
+            // was opened some other way), throttled so a busy home screen costs little.
+            val interval = if (active) HOME_EVENT_MS else IDLE_HOME_EVENT_MS
+            if (now - lastHomeEvent > interval) {
+                lastHomeEvent = now
+                worker.post {
+                    guarded("home") {
+                        if (active) lastFullScan = 0L else if (hiddenNow().isNotEmpty()) scheduleTick(0)
+                    }
                 }
-            } else if (now - lastIdleScan > IDLE_SCAN_MS && hiddenNow().isNotEmpty()) {
-                lastIdleScan = now
-                lookCloselyFor(now)
             }
             return
         }
-
-        // Another app's window changed while Recents is (or may be) up: check what's in front.
-        if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            pkg != SYSTEM_UI && pkg != packageName && (active || now < armedUntil)
-        ) {
-            lookCloselyFor(now)
+        if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != SYSTEM_UI && pkg != packageName) {
+            worker.post { guarded("window") { if (active || SystemClock.uptimeMillis() < armedUntil) arm() } }
         }
     }
 
-    /** Scan right away and then every 30 ms for a little while. */
-    private fun lookCloselyFor(now: Long) {
-        armedUntil = now + ARMED_MS
-        requestScan()
-        startPeriodicScans()
+    // ---------------------------------------------------------------- worker thread
+
+    /** Check right away, then every 30 ms for a little while. */
+    private fun arm() {
+        if (hiddenNow().isEmpty() && !active) return
+        armedUntil = SystemClock.uptimeMillis() + ARMED_MS
+        lastFullScan = 0L
+        worker.removeCallbacks(tick)
+        tickScheduled = false
+        scheduleTick(0)
     }
 
-    private enum class NavButton { RECENTS, HOME, BACK }
-
-    private fun navButton(e: AccessibilityEvent): NavButton? {
-        val id = try { e.source?.viewIdResourceName } catch (_: Exception) { null }?.substringAfter(":id/") ?: ""
-        when (id) {
-            "recent_apps", "recents" -> return NavButton.RECENTS
-            "home", "home_button" -> return NavButton.HOME
-            "back", "back_button" -> return NavButton.BACK
-        }
-        val desc = (e.contentDescription?.toString() ?: e.text.joinToString(" ")).trim().lowercase()
-        return when {
-            "recent" in desc || "overview" in desc -> NavButton.RECENTS
-            desc == "home" -> NavButton.HOME
-            desc == "back" -> NavButton.BACK
-            else -> null
-        }
+    private fun scheduleTick(delay: Long) {
+        if (tickScheduled) return
+        tickScheduled = true
+        worker.postDelayed(tick, delay)
     }
 
-    // ---------------------------------------------------------------- scanning (background)
-
-    /** What a scan saw. [appInFront] is set when a regular app window has input focus. */
-    private class ScanOut(val result: RecentsScanner.Result?, val appInFront: String?)
-
-    private fun requestScan() {
-        if (!scanQueued.compareAndSet(false, true)) return
-        val posted = scanHandler.post {
-            scanQueued.set(false)
-            val out = try {
-                scanScreen()
-            } catch (t: Throwable) {
-                logError("scan", t)
-                ScanOut(null, null)
-            }
-            main.post { guarded("applyScan") { applyScan(out) } }
-        }
-        if (!posted) scanQueued.set(false)
-    }
-
-    private fun scanScreen(): ScanOut {
-        val hidden = hiddenNow()
-        var appInFront: String? = null
-        val homeRoots = ArrayList<Pair<AccessibilityNodeInfo, Boolean>>()
-        try {
-            for (w in windows) {
-                val root = w.root ?: continue
-                val pkg = root.packageName?.toString() ?: continue
-                if (pkg in homePackages) {
-                    homeRoots.add(root to w.isFocused)
-                } else if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION && w.isFocused && pkg != packageName) {
-                    appInFront = pkg
-                }
-            }
-        } catch (_: Exception) {}
-        if (homeRoots.isEmpty()) {
-            val r = try { rootInActiveWindow } catch (_: Exception) { null }
-            if (r != null && r.packageName?.toString()?.let { it in homePackages } == true) homeRoots.add(r to true)
-        }
-        // Check the focused home window first; use whichever one shows Recents.
-        var result: RecentsScanner.Result? = null
-        for ((root, _) in homeRoots.sortedByDescending { it.second }) {
-            val r = RecentsScanner.scan(root, hidden)
-            if (r.isRecents) { result = r; break }
-            if (result == null) result = r
-        }
-        return ScanOut(result, appInFront)
-    }
-
-    private val periodicScan = object : Runnable {
-        override fun run() {
-            val now = SystemClock.uptimeMillis()
-            if (!active && now >= armedUntil) return
-            guarded("periodic") { requestScan() }
-            scanHandler.postDelayed(this, if (now < armedUntil) FAST_SCAN_MS else PERIODIC_SCAN_MS)
-        }
-    }
-
-    private fun startPeriodicScans() {
-        scanHandler.removeCallbacks(periodicScan)
-        scanHandler.postDelayed(periodicScan, FAST_SCAN_MS)
-    }
-
-    private fun applyScan(out: ScanOut) {
+    private val tick = Runnable {
+        tickScheduled = false
+        guarded("tick") { doTick() }
         val now = SystemClock.uptimeMillis()
-        val result = out.result
-        val recentsUp = result != null && result.isRecents && out.appInFront == null
-        if (recentsUp) {
+        if (active || now < armedUntil) scheduleTick(TICK_MS)
+    }
+
+    private fun doTick() {
+        val now = SystemClock.uptimeMillis()
+        val hidden = hiddenNow()
+        if (hidden.isEmpty()) {
+            if (active) turnOff(now, "nothing to hide right now")
+            return
+        }
+
+        val ws = try { windows } catch (_: Exception) { emptyList<AccessibilityWindowInfo>() }
+
+        // 1) Is a regular app in front? Then Recents isn't showing.
+        val front = frontApp(ws)
+        if (front != null) {
+            if (active) turnOff(now, "$front is in front")
+            return
+        }
+
+        // 2) Full read of the Recents screen when starting, and every 250 ms while on.
+        if (!active || cards.isEmpty() || now - lastFullScan >= FULL_SCAN_MS) {
+            lastFullScan = now
+            val res = readRecents(ws, hidden)
+            if (res == null || !res.isRecents) {
+                if (active && ++misses >= 3) {
+                    turnOff(now, "Recents no longer showing (" + (if (res == null) "couldn't read the screen" else "no Recents cards found") + ")")
+                }
+                return
+            }
             misses = 0
-            cards = result!!.cards
+            cards = res.cards
             if (!active) {
                 active = true
-                framesSinceOn = 0
-                framesWithBoxes = 0
-                refreshFails = 0
+                ticks = 0; ticksWithBoxes = 0; failedReads = 0
                 Diag.log(this, "Shield on")
-                startPeriodicScans()
-                Choreographer.getInstance().postFrameCallback(frame)
+                main.post { startDrawing() }
             }
-            return
         }
-        if (!active) return
-        if (out.appInFront != null) {
-            Diag.log(this, "Shield off: ${out.appInFront} is in front [${statsText()}]")
-            turnOff(now)
-            return
-        }
-        // Recents not seen. A single read can come back wrong, so it takes three in a row.
-        if (++misses >= 3) {
-            val why = if (result == null) "couldn't read the screen" else "no Recents cards found"
-            Diag.log(this, "Shield off: Recents no longer showing ($why) [${statsText()}]")
-            turnOff(now)
-        }
+
+        // 3) Fresh positions for the boxes.
+        publish(hidden, now)
     }
 
-    /** Switch off, but keep checking for a moment: if that was a misread, it comes straight back on. */
-    private fun turnOff(now: Long) {
-        goIdle()
-        armedUntil = now + RECHECK_AFTER_OFF_MS
-        startPeriodicScans()
-    }
+    // Which app each window belongs to, so we ask each window only once.
+    private val windowPkg = HashMap<Int, String>()
 
-    private fun goIdle() {
-        active = false
-        misses = 0
-        cards = emptyList()
-        motion.clear()
-        // Periodic scans stop by themselves once the close-look window is over.
-        Choreographer.getInstance().removeFrameCallback(frame)
-        overlay.hide()
-    }
-
-    // ---------------------------------------------------------------- per-frame tracking (main)
-
-    private val frame = object : Choreographer.FrameCallback {
-        override fun doFrame(frameTimeNanos: Long) {
-            if (!active) return
-            guarded("frame") { trackAndDraw() }
-            Choreographer.getInstance().postFrameCallback(this)
+    private fun frontApp(ws: List<AccessibilityWindowInfo>): String? {
+        if (windowPkg.size > 64) windowPkg.clear()
+        for (w in ws) {
+            if (w.type != AccessibilityWindowInfo.TYPE_APPLICATION || !w.isFocused) continue
+            val pkg = windowPkg[w.id] ?: (try { w.root?.packageName?.toString() } catch (_: Exception) { null })
+                ?.also { windowPkg[w.id] = it } ?: continue
+            if (pkg !in homePackages && pkg != packageName) return pkg
         }
+        return null
     }
 
-    private class Live(val card: Card, val hidden: Boolean, val scene: Rect, val icon: Rect?, val z: Float)
-
-    // Per-session counters, reported in the log when the shield turns off.
-    private var framesSinceOn = 0
-    private var framesWithBoxes = 0
-    private var refreshFails = 0
-
-    private fun statsText() = "frames=$framesSinceOn, with boxes=$framesWithBoxes, failed re-reads=$refreshFails, " +
-        "hidden cards in last scan=${cards.count { RecentsScanner.isHidden(it.label, hiddenNow()) }}"
-
-    private fun trackAndDraw() {
-        framesSinceOn++
-        val hidden = hiddenNow()
-        val current = cards
-        if (hidden.isEmpty() || current.isEmpty()) {
-            overlay.show(emptyList())
-            return
+    /** Reads the home app's window(s). Null if none could be read. */
+    private fun readRecents(ws: List<AccessibilityWindowInfo>, hidden: List<HiddenApp>): RecentsScanner.Result? {
+        val roots = ArrayList<Pair<AccessibilityNodeInfo, Boolean>>()
+        for (w in ws) {
+            val root = try { w.root } catch (_: Exception) { null } ?: continue
+            if (root.packageName?.toString()?.let { it in homePackages } == true) roots.add(root to w.isFocused)
         }
-        val now = SystemClock.uptimeMillis()
-        val screen = resources.displayMetrics
-        val cx = screen.widthPixels / 2f
-        val cy = screen.heightPixels / 2f
-        val maxShift = screen.widthPixels * 0.12f
+        if (roots.isEmpty()) {
+            val r = try { rootInActiveWindow } catch (_: Exception) { null }
+            if (r != null && r.packageName?.toString()?.let { it in homePackages } == true) roots.add(r to true)
+        }
+        var result: RecentsScanner.Result? = null
+        for ((root, _) in roots.sortedByDescending { it.second }) {
+            val r = RecentsScanner.scan(root, hidden)
+            if (r.isRecents) return r
+            if (result == null) result = r
+        }
+        return result
+    }
 
-        val lives = ArrayList<Live>(current.size)
-        for (c in current) {
+    private class Live(val hidden: Boolean, val scene: Rect, val icon: Rect?, val z: Float, val vx: Float)
+
+    /** Re-read card positions and publish the boxes for drawing. */
+    private fun publish(hidden: List<HiddenApp>, now: Long) {
+        ticks++
+        val dm = resources.displayMetrics
+        val cx = dm.widthPixels / 2f
+        val cy = dm.heightPixels / 2f
+
+        val lives = ArrayList<Live>(cards.size)
+        for (c in cards) {
             val ok = try { c.node.refresh() && c.node.isVisibleToUser } catch (_: Exception) { false }
             var r = Rect()
             if (ok) c.node.getBoundsInScreen(r)
-            val live = ok && r.width() > 0 && r.height() > 0
             val label: String
             var icon: Rect? = null
-            if (live) {
-                // Re-read the name every frame: scrolling can recycle this view for another app.
+            if (ok && r.width() > 0 && r.height() > 0) {
+                // Re-read the name too: scrolling can recycle this view for another app.
                 label = RecentsScanner.labelOf(c.node).ifEmpty { c.label }
                 if (c.icon != null) {
                     val iok = try { c.icon.refresh() && c.icon.isVisibleToUser } catch (_: Exception) { false }
@@ -349,43 +292,39 @@ class ShieldService : AccessibilityService() {
                     }
                 }
             } else {
-                // The live re-read failed (Samsung sometimes swaps the card's view out).
-                // Fall back to where the latest scan saw it, as long as that's recent.
-                refreshFails++
+                // Couldn't re-read (Samsung can swap the card's view): use the latest scan.
+                failedReads++
                 if (now - c.scannedAt > SCAN_FALLBACK_MS) continue
                 r = Rect(c.scanBounds)
                 label = c.label
                 icon = c.scanIconBounds?.let { Rect(it) }
             }
-            val isHidden = RecentsScanner.isHidden(label, hidden)
             r.top += (r.height() * c.sceneTopRatio).toInt()
 
-            // Predict where the card will be when this frame is shown, from its scroll speed.
-            val m = motion[c.node]
+            // Speed of the card (px/ms), for the main thread to move the box ahead.
             val x = r.exactCenterX()
+            val m = motion[c.node]
+            val vx: Float
             if (m == null) {
                 motion[c.node] = Motion(x, now, 0f)
+                vx = 0f
             } else {
                 val dt = (now - m.t).coerceAtLeast(1L)
-                val inst = (x - m.x) / dt
-                m.vx = if (dt > 100) 0f else m.vx * 0.4f + inst * 0.6f
+                m.vx = if (dt > 150) 0f else m.vx * 0.3f + ((x - m.x) / dt) * 0.7f
                 m.x = x
                 m.t = now
-                val shift = (m.vx * LEAD_MS).coerceIn(-maxShift, maxShift).toInt()
-                if (abs(shift) >= 2) {
-                    r.offset(shift, 0)
-                    icon?.offset(shift, 0)
-                }
+                vx = m.vx
             }
 
             // Cards in front are drawn bigger (the middle of the carousel); ties go to the
             // one nearer the middle, then to drawing order.
             val dist = hypot(r.exactCenterX() - cx, r.exactCenterY() - cy)
             val z = r.height() * 1000f - dist + c.drawingOrder * 0.001f
-            lives.add(Live(c, isHidden, r, icon, z))
+            lives.add(Live(RecentsScanner.isHidden(label, hidden), r, icon, z, vx))
         }
 
         val shields = ArrayList<Shield>()
+        val speeds = ArrayList<Float>()
         for (h in lives) {
             if (!h.hidden) continue
             val cuts = ArrayList<Rect>()
@@ -393,30 +332,71 @@ class ShieldService : AccessibilityService() {
             h.icon?.let { cuts.add(it); isIcon.add(true) } // keep its own badge visible
             for (o in lives) {
                 if (o === h || o.z <= h.z) continue
-                if (!o.hidden && Rect.intersects(o.scene, h.scene)) {
-                    cuts.add(o.scene); isIcon.add(false)
-                }
+                if (!o.hidden && Rect.intersects(o.scene, h.scene)) { cuts.add(o.scene); isIcon.add(false) }
                 o.icon?.let { if (Rect.intersects(it, h.scene)) { cuts.add(it); isIcon.add(true) } }
             }
             shields.add(Shield(h.scene, cuts, isIcon))
+            speeds.add(h.vx)
         }
-        if (shields.isNotEmpty()) framesWithBoxes++
-        overlay.show(shields)
+        if (shields.isNotEmpty()) ticksWithBoxes++
+        snapshot = Snapshot(shields, speeds.toFloatArray(), now)
+    }
+
+    /** Switch off, but keep checking for a moment: if that was a misread, it comes straight back on. */
+    private fun turnOff(now: Long, reason: String) {
+        Diag.log(this, "Shield off: $reason [checks=$ticks, with boxes=$ticksWithBoxes, failed re-reads=$failedReads]")
+        active = false
+        misses = 0
+        cards = emptyList()
+        motion.clear()
+        snapshot = null
+        main.post { stopDrawing() }
+        armedUntil = now + RECHECK_AFTER_OFF_MS
+    }
+
+    // ---------------------------------------------------------------- drawing (main thread)
+
+    private fun startDrawing() {
+        if (drawing) return
+        drawing = true
+        Choreographer.getInstance().postFrameCallback(frame)
+    }
+
+    private fun stopDrawing() {
+        drawing = false
+        Choreographer.getInstance().removeFrameCallback(frame)
+        overlay.hide()
+    }
+
+    private val frame = object : Choreographer.FrameCallback {
+        override fun doFrame(frameTimeNanos: Long) {
+            if (!drawing) return
+            guarded("draw") { drawLatest() }
+            Choreographer.getInstance().postFrameCallback(this)
+        }
+    }
+
+    private fun drawLatest() {
+        val s = snapshot ?: return
+        val now = SystemClock.uptimeMillis()
+        // Move each box ahead by its card's speed: time since the positions were read,
+        // plus one frame. Capped, so a stalled read can't send a box flying.
+        val dt = (now - s.time + LEAD_MS).coerceIn(0L, MAX_EXTRAPOLATE_MS).toFloat()
+        val maxShift = resources.displayMetrics.widthPixels * 0.15f
+        val out = ArrayList<Shield>(s.shields.size)
+        for (i in s.shields.indices) {
+            val sh = s.shields[i]
+            val dx = (s.vx[i] * dt).coerceIn(-maxShift, maxShift).toInt()
+            if (dx == 0) {
+                out.add(sh)
+            } else {
+                out.add(Shield(Rect(sh.box).apply { offset(dx, 0) }, sh.cutouts.map { Rect(it).apply { offset(dx, 0) } }, sh.cutoutIsIcon))
+            }
+        }
+        overlay.show(out)
     }
 
     // ---------------------------------------------------------------- helpers
-
-    /** The home app's window root, and whether that window is the one in front. */
-    private fun findHomeRoot(): Pair<AccessibilityNodeInfo, Boolean>? {
-        try {
-            for (w in windows) {
-                val r = w.root ?: continue
-                if (r.packageName?.toString()?.let { it in homePackages } == true) return r to (w.isActive || w.isFocused)
-            }
-        } catch (_: Exception) {}
-        val r = try { rootInActiveWindow } catch (_: Exception) { null } ?: return null
-        return if (r.packageName?.toString()?.let { it in homePackages } == true) r to true else null
-    }
 
     private fun findHomePackages(): Set<String> {
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
@@ -428,51 +408,55 @@ class ShieldService : AccessibilityService() {
         return found
     }
 
-    /** Saves what the Recents screen looked like, so problems can be diagnosed. Runs on the scan thread. */
+    private fun scheduleDiagnostics() {
+        val now = SystemClock.uptimeMillis()
+        if (now - lastDiag < 1500) return
+        lastDiag = now
+        worker.postDelayed({ guarded("diagnostics") { writeDiagnostics() } }, DIAG_DELAY_MS)
+    }
+
+    /** Saves what the Recents screen looked like, so problems can be diagnosed. Worker thread. */
     private fun writeDiagnostics() {
-        try {
-            val hidden = hiddenNow()
-            val root = findHomeRoot()?.first
-            val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date())
-            if (root == null) {
-                Prefs.setSummary(this, "$time: Recents button seen, but the Recents screen couldn't be read.")
-                Prefs.dumpFile(this).writeText("No home-app window found. Home packages: $homePackages\n")
-                return
-            }
-            val r = RecentsScanner.scan(root, hidden)
-            val found = r.cards.filter { RecentsScanner.isHidden(it.label, hidden) }.map { it.label }
-            val foundText = if (found.isEmpty()) "none" else found.joinToString(", ")
-            Prefs.setSummary(
-                this,
-                "$time: Recents screen recognised: ${if (r.isRecents) "yes" else "NO"}. Hidden cards on screen: $foundText.",
-            )
-            val b = Rect()
-            val version = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
-            val header = buildString {
-                append("Version: $version\n")
-                append("Shield active: $active\n")
-                append("Recents recognised: ${r.isRecents}\n")
-                append("Windows (front to back):\n")
-                try {
-                    for (w in windows) {
-                        val wp = try { w.root?.packageName } catch (_: Exception) { null }
-                        append("  type=${w.type} pkg=$wp focused=${w.isFocused} active=${w.isActive} layer=${w.layer}\n")
-                    }
-                } catch (_: Exception) {}
-                append("Hidden now: ${hidden.joinToString { "${it.pkg} ${it.labels}" }}\n")
-                append("Always: $always\n")
-                append("Schedules: ${schedules.joinToString { "${it.name} on=${it.enabled} days=${it.days} ${it.startMin}-${it.endMin} apps=${it.apps}" }}\n")
-                append("Cards:\n")
-                for (c in r.cards) {
-                    c.node.getBoundsInScreen(b)
-                    append("  ${c.label} card=${b.toShortString()} sceneTop=${c.sceneTopRatio} z=${c.drawingOrder}\n")
-                }
-                append('\n')
-            }
-            Prefs.dumpFile(this).writeText(header + RecentsScanner.dump(root))
-        } catch (t: Throwable) {
-            logError("diagnostics", t)
+        val hidden = hiddenNow()
+        val ws = try { windows } catch (_: Exception) { emptyList<AccessibilityWindowInfo>() }
+        val r = readRecents(ws, hidden)
+        val time = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date())
+        if (r == null) {
+            Prefs.setSummary(this, "$time: Recents button seen, but the Recents screen couldn't be read.")
+            Prefs.dumpFile(this).writeText("No home-app window found. Home packages: $homePackages\n")
+            return
         }
+        val found = r.cards.filter { RecentsScanner.isHidden(it.label, hidden) }.map { it.label }
+        val foundText = if (found.isEmpty()) "none" else found.joinToString(", ")
+        Prefs.setSummary(
+            this,
+            "$time: Recents screen recognised: ${if (r.isRecents) "yes" else "NO"}. Hidden cards on screen: $foundText.",
+        )
+        val version = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
+        val root = r.cards.firstOrNull()?.node?.let { n ->
+            var cur: AccessibilityNodeInfo = n
+            while (true) { cur = try { cur.parent } catch (_: Exception) { null } ?: break }
+            cur
+        }
+        val header = buildString {
+            append("Version: $version\n")
+            append("Shield active: $active\n")
+            append("Recents recognised: ${r.isRecents}\n")
+            append("Windows (front to back):\n")
+            for (w in ws) {
+                val wp = try { w.root?.packageName } catch (_: Exception) { null }
+                append("  type=${w.type} pkg=$wp focused=${w.isFocused} active=${w.isActive} layer=${w.layer}\n")
+            }
+            append("Hidden now: ${hidden.joinToString { "${it.pkg} ${it.labels}" }}\n")
+            append("Always: $always\n")
+            append("Schedules: ${schedules.joinToString { "${it.name} on=${it.enabled} days=${it.days} ${it.startMin}-${it.endMin} apps=${it.apps}" }}\n")
+            append("Cards:\n")
+            for (c in r.cards) {
+                append("  ${c.label} card=${c.scanBounds.toShortString()} sceneTop=${c.sceneTopRatio} z=${c.drawingOrder}\n")
+            }
+            append('\n')
+        }
+        Prefs.dumpFile(this).writeText(header + (root?.let { RecentsScanner.dump(it) } ?: ""))
     }
 
     /** Run [block]; log instead of crashing (a crash stops the shield until the app is reopened). */
@@ -480,11 +464,11 @@ class ShieldService : AccessibilityService() {
         try { block() } catch (t: Throwable) { logError(where, t) }
     }
 
-    private var lastErrorLog = 0L
+    @Volatile private var lastErrorLog = 0L
 
     private fun logError(where: String, t: Throwable) {
         val now = SystemClock.uptimeMillis()
-        if (now - lastErrorLog < 5_000) return // don't flood the log from a per-frame error
+        if (now - lastErrorLog < 5_000) return // don't flood the log from a repeating error
         lastErrorLog = now
         Diag.log(this, "Error in $where", t)
     }
@@ -499,26 +483,29 @@ class ShieldService : AccessibilityService() {
 
     override fun onDestroy() {
         cleanup()
-        scanThread.quitSafely()
+        workerThread.quitSafely()
         super.onDestroy()
     }
 
     private fun cleanup() {
-        main.post { goIdle() }
-        scanHandler.removeCallbacksAndMessages(null)
+        worker.removeCallbacksAndMessages(null)
+        active = false
+        snapshot = null
+        main.post { if (::overlay.isInitialized) stopDrawing() }
         if (::prefs.isInitialized) prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
     }
 
     companion object {
         private const val SYSTEM_UI = "com.android.systemui"
-        private const val FAST_SCAN_MS = 30L        // while Recents is opening
-        private const val PERIODIC_SCAN_MS = 120L   // while Recents is open (positions update every frame regardless)
-        private const val ACTIVE_EVENT_SCAN_MS = 60L
-        private const val IDLE_SCAN_MS = 150L
+        private const val TICK_MS = 33L               // ~30 position reads per second while on
+        private const val FULL_SCAN_MS = 250L
+        private const val HOME_EVENT_MS = 60L
+        private const val IDLE_HOME_EVENT_MS = 250L
         private const val ARMED_MS = 1200L
         private const val RECHECK_AFTER_OFF_MS = 1500L
         private const val SCAN_FALLBACK_MS = 400L
-        private const val LEAD_MS = 16L             // how far ahead to predict scrolling
+        private const val LEAD_MS = 16L               // predict one frame ahead
+        private const val MAX_EXTRAPOLATE_MS = 120L
         private const val DIAG_DELAY_MS = 700L
     }
 }

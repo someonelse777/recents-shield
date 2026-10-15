@@ -11,8 +11,8 @@ android {
         applicationId = "com.recentsshield"
         minSdk = 29
         targetSdk = 34
-        versionCode = 8
-        versionName = "0.8"
+        versionCode = 9
+        versionName = "0.9"
     }
 
     // A fixed signing key that lives in the repo, so every GitHub build can be
