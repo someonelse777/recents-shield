@@ -8,6 +8,7 @@ object Prefs {
     private const val NAME = "shield"
     const val KEY_HIDDEN = "hidden_packages"
     const val KEY_SUMMARY = "last_summary"
+    const val KEY_DEBUG_OUTLINE = "debug_outline"
     private const val DUMP_FILE = "last_recents_dump.txt"
 
     fun get(c: Context): SharedPreferences = c.getSharedPreferences(NAME, Context.MODE_PRIVATE)

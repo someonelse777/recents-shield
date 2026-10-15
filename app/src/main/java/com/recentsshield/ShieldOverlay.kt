@@ -28,11 +28,30 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
 
     private var view: ShieldView? = null
 
+    // Diagnostics: what the window is actually doing.
+    @Volatile var adds = 0
+        private set
+    @Volatile var lastAddError: String? = null
+        private set
+    @Volatile private var lastView: ShieldView? = null
+
+    fun stats(): String {
+        val v = lastView
+        return "window adds=$adds" + (lastAddError?.let { ", add error=$it" } ?: "") +
+            (v?.let { ", draws=${it.draws}, painted boxes=${it.paintedBoxes}, attached=${it.isAttachedToWindow}, " +
+                "visibility=${it.windowVisibilityText}, size=${it.width}x${it.height}, at=${it.lastLoc}" } ?: ", no window yet")
+    }
+
     fun show(shields: List<Shield>) {
         // Nothing to draw and nothing showing: don't create a window at all.
         if (shields.isEmpty() && view == null) return
         val v = attach() ?: return
         v.setShields(shields)
+    }
+
+    /** Put the window up even with nothing to draw (used by the debug red border). */
+    fun ensureAttached() {
+        attach()
     }
 
     fun hide() {
@@ -45,7 +64,7 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
 
     private fun attach(): ShieldView? {
         view?.let { return it }
-        val v = ShieldView(ctx)
+        val v = ShieldView(ctx, Prefs.get(ctx).getBoolean(Prefs.KEY_DEBUG_OUTLINE, false))
         val lp = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -66,8 +85,11 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
         return try {
             wm.addView(v, lp)
             view = v
+            lastView = v
+            adds++
             v
         } catch (e: Exception) {
+            lastAddError = "${e.javaClass.simpleName}: ${e.message}"
             // Android can briefly refuse the overlay (e.g. while the service reconnects).
             // That used to crash the service; now we skip this frame and try again.
             val now = android.os.SystemClock.uptimeMillis()
@@ -78,7 +100,27 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
     }
 }
 
-private class ShieldView(ctx: Context) : View(ctx) {
+private class ShieldView(ctx: Context, private val debugOutline: Boolean) : View(ctx) {
+    @Volatile var draws = 0
+    @Volatile var paintedBoxes = 0
+    @Volatile var lastLoc = "?"
+    @Volatile var windowVisibilityText = "unknown"
+    private val debugPaint = Paint().apply {
+        color = Color.RED
+        style = Paint.Style.STROKE
+        strokeWidth = 8f * ctx.resources.displayMetrics.density
+    }
+
+    override fun onWindowVisibilityChanged(visibility: Int) {
+        super.onWindowVisibilityChanged(visibility)
+        windowVisibilityText = when (visibility) {
+            View.VISIBLE -> "visible"
+            View.INVISIBLE -> "invisible"
+            View.GONE -> "gone"
+            else -> visibility.toString()
+        }
+    }
+
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
         style = Paint.Style.FILL
@@ -97,8 +139,12 @@ private class ShieldView(ctx: Context) : View(ctx) {
     }
 
     override fun onDraw(canvas: Canvas) {
+        draws++
+        if (debugOutline) canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), debugPaint)
         if (shields.isEmpty()) return
+        paintedBoxes += shields.size
         getLocationOnScreen(loc)
+        lastLoc = "${loc[0]},${loc[1]}"
         val ox = loc[0].toFloat()
         val oy = loc[1].toFloat()
         // Screen edges, in screen coordinates.

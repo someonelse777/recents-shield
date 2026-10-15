@@ -221,7 +221,7 @@ class ShieldService : AccessibilityService() {
             cards = res.cards
             if (!active) {
                 active = true
-                ticks = 0; ticksWithBoxes = 0; failedReads = 0
+                ticks = 0; ticksWithBoxes = 0; failedReads = 0; framesDrawn = 0
                 Diag.log(this, "Shield on")
                 main.post { startDrawing() }
             }
@@ -344,7 +344,9 @@ class ShieldService : AccessibilityService() {
 
     /** Switch off, but keep checking for a moment: if that was a misread, it comes straight back on. */
     private fun turnOff(now: Long, reason: String) {
-        Diag.log(this, "Shield off: $reason [checks=$ticks, with boxes=$ticksWithBoxes, failed re-reads=$failedReads]")
+        val ov = if (::overlay.isInitialized) overlay.stats() else "no overlay"
+        Diag.log(this, "Shield off: $reason [checks=$ticks, with boxes=$ticksWithBoxes, failed re-reads=$failedReads, " +
+            "frames=$framesDrawn, $ov]")
         active = false
         misses = 0
         cards = emptyList()
@@ -359,6 +361,7 @@ class ShieldService : AccessibilityService() {
     private fun startDrawing() {
         if (drawing) return
         drawing = true
+        if (prefs.getBoolean(Prefs.KEY_DEBUG_OUTLINE, false)) overlay.ensureAttached()
         Choreographer.getInstance().postFrameCallback(frame)
     }
 
@@ -376,7 +379,10 @@ class ShieldService : AccessibilityService() {
         }
     }
 
+    @Volatile private var framesDrawn = 0
+
     private fun drawLatest() {
+        framesDrawn++
         val s = snapshot ?: return
         val now = SystemClock.uptimeMillis()
         // Move each box ahead by its card's speed: time since the positions were read,

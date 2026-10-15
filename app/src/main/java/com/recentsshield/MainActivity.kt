@@ -120,6 +120,16 @@ class MainActivity : Activity() {
             setOnClickListener { startActivity(ScheduleActivity.intent(this@MainActivity, null)) }
         })
 
+        // Troubleshooting
+        root.addView(sectionTitle("Troubleshooting"))
+        root.addView(android.widget.CheckBox(this).apply {
+            text = "Debug: red border on screen while the shield's window is up"
+            isChecked = Prefs.get(this@MainActivity).getBoolean(Prefs.KEY_DEBUG_OUTLINE, false)
+            setOnCheckedChangeListener { _, on ->
+                Prefs.get(this@MainActivity).edit().putBoolean(Prefs.KEY_DEBUG_OUTLINE, on).apply()
+            }
+        })
+
         setContentView(ScrollView(this).apply { addView(root) })
     }
 
