@@ -256,6 +256,9 @@ class ShieldService : AccessibilityService() {
             cards = result!!.cards
             if (!active) {
                 active = true
+                framesSinceOn = 0
+                framesWithBoxes = 0
+                refreshFails = 0
                 Diag.log(this, "Shield on")
                 startPeriodicScans()
                 Choreographer.getInstance().postFrameCallback(frame)
@@ -264,14 +267,14 @@ class ShieldService : AccessibilityService() {
         }
         if (!active) return
         if (out.appInFront != null) {
-            Diag.log(this, "Shield off: ${out.appInFront} is in front")
+            Diag.log(this, "Shield off: ${out.appInFront} is in front [${statsText()}]")
             turnOff(now)
             return
         }
         // Recents not seen. A single read can come back wrong, so it takes three in a row.
         if (++misses >= 3) {
             val why = if (result == null) "couldn't read the screen" else "no Recents cards found"
-            Diag.log(this, "Shield off: Recents no longer showing ($why)")
+            Diag.log(this, "Shield off: Recents no longer showing ($why) [${statsText()}]")
             turnOff(now)
         }
     }
@@ -305,7 +308,16 @@ class ShieldService : AccessibilityService() {
 
     private class Live(val card: Card, val hidden: Boolean, val scene: Rect, val icon: Rect?, val z: Float)
 
+    // Per-session counters, reported in the log when the shield turns off.
+    private var framesSinceOn = 0
+    private var framesWithBoxes = 0
+    private var refreshFails = 0
+
+    private fun statsText() = "frames=$framesSinceOn, with boxes=$framesWithBoxes, failed re-reads=$refreshFails, " +
+        "hidden cards in last scan=${cards.count { RecentsScanner.isHidden(it.label, hiddenNow()) }}"
+
     private fun trackAndDraw() {
+        framesSinceOn++
         val hidden = hiddenNow()
         val current = cards
         if (hidden.isEmpty() || current.isEmpty()) {
@@ -318,25 +330,35 @@ class ShieldService : AccessibilityService() {
         val cy = screen.heightPixels / 2f
         val maxShift = screen.widthPixels * 0.12f
 
-        val live = ArrayList<Live>(current.size)
+        val lives = ArrayList<Live>(current.size)
         for (c in current) {
-            val ok = try { c.node.refresh() } catch (_: Exception) { false }
-            if (!ok || !c.node.isVisibleToUser) continue
-            val r = Rect().also { c.node.getBoundsInScreen(it) }
-            if (r.width() <= 0 || r.height() <= 0) continue
-            // Re-read the name every frame: scrolling can recycle this view for another app.
-            val label = RecentsScanner.labelOf(c.node).ifEmpty { c.label }
+            val ok = try { c.node.refresh() && c.node.isVisibleToUser } catch (_: Exception) { false }
+            var r = Rect()
+            if (ok) c.node.getBoundsInScreen(r)
+            val live = ok && r.width() > 0 && r.height() > 0
+            val label: String
+            var icon: Rect? = null
+            if (live) {
+                // Re-read the name every frame: scrolling can recycle this view for another app.
+                label = RecentsScanner.labelOf(c.node).ifEmpty { c.label }
+                if (c.icon != null) {
+                    val iok = try { c.icon.refresh() && c.icon.isVisibleToUser } catch (_: Exception) { false }
+                    if (iok) {
+                        val ir = Rect().also { c.icon.getBoundsInScreen(it) }
+                        if (ir.width() > 0 && ir.height() > 0) icon = ir
+                    }
+                }
+            } else {
+                // The live re-read failed (Samsung sometimes swaps the card's view out).
+                // Fall back to where the latest scan saw it, as long as that's recent.
+                refreshFails++
+                if (now - c.scannedAt > SCAN_FALLBACK_MS) continue
+                r = Rect(c.scanBounds)
+                label = c.label
+                icon = c.scanIconBounds?.let { Rect(it) }
+            }
             val isHidden = RecentsScanner.isHidden(label, hidden)
             r.top += (r.height() * c.sceneTopRatio).toInt()
-
-            var icon: Rect? = null
-            if (c.icon != null) {
-                val iok = try { c.icon.refresh() } catch (_: Exception) { false }
-                if (iok && c.icon.isVisibleToUser) {
-                    val ir = Rect().also { c.icon.getBoundsInScreen(it) }
-                    if (ir.width() > 0 && ir.height() > 0) icon = ir
-                }
-            }
 
             // Predict where the card will be when this frame is shown, from its scroll speed.
             val m = motion[c.node]
@@ -360,16 +382,16 @@ class ShieldService : AccessibilityService() {
             // one nearer the middle, then to drawing order.
             val dist = hypot(r.exactCenterX() - cx, r.exactCenterY() - cy)
             val z = r.height() * 1000f - dist + c.drawingOrder * 0.001f
-            live.add(Live(c, isHidden, r, icon, z))
+            lives.add(Live(c, isHidden, r, icon, z))
         }
 
         val shields = ArrayList<Shield>()
-        for (h in live) {
+        for (h in lives) {
             if (!h.hidden) continue
             val cuts = ArrayList<Rect>()
             val isIcon = ArrayList<Boolean>()
             h.icon?.let { cuts.add(it); isIcon.add(true) } // keep its own badge visible
-            for (o in live) {
+            for (o in lives) {
                 if (o === h || o.z <= h.z) continue
                 if (!o.hidden && Rect.intersects(o.scene, h.scene)) {
                     cuts.add(o.scene); isIcon.add(false)
@@ -378,6 +400,7 @@ class ShieldService : AccessibilityService() {
             }
             shields.add(Shield(h.scene, cuts, isIcon))
         }
+        if (shields.isNotEmpty()) framesWithBoxes++
         overlay.show(shields)
     }
 
@@ -494,6 +517,7 @@ class ShieldService : AccessibilityService() {
         private const val IDLE_SCAN_MS = 150L
         private const val ARMED_MS = 1200L
         private const val RECHECK_AFTER_OFF_MS = 1500L
+        private const val SCAN_FALLBACK_MS = 400L
         private const val LEAD_MS = 16L             // how far ahead to predict scrolling
         private const val DIAG_DELAY_MS = 700L
     }

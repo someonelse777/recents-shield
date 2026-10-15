@@ -21,6 +21,10 @@ class Card(
     val icon: AccessibilityNodeInfo?,
     val label: String,
     val drawingOrder: Int,
+    /** Where the card and badge were when scanned, used if a live re-read fails. */
+    val scanBounds: Rect,
+    val scanIconBounds: Rect?,
+    val scannedAt: Long = android.os.SystemClock.uptimeMillis(),
 )
 
 /**
@@ -73,12 +77,13 @@ object RecentsScanner {
             }
         }
         var ratio = 0f
+        val cb = Rect().also { card.getBoundsInScreen(it) }
         if (scene != null) {
-            val cb = Rect().also { card.getBoundsInScreen(it) }
             val sb = Rect().also { scene.getBoundsInScreen(it) }
             if (cb.height() > 0) ratio = ((sb.top - cb.top).toFloat() / cb.height()).coerceIn(0f, 0.3f)
         }
-        return Card(card, ratio, icon, labelOf(card), card.drawingOrder)
+        val ib = icon?.let { i -> Rect().also { i.getBoundsInScreen(it) }.takeIf { it.width() > 0 && it.height() > 0 } }
+        return Card(card, ratio, icon, labelOf(card), card.drawingOrder, cb, ib)
     }
 
     fun labelOf(n: AccessibilityNodeInfo): String = (n.contentDescription ?: n.text)?.toString()?.trim() ?: ""
@@ -99,7 +104,7 @@ object RecentsScanner {
                 val found: AccessibilityNodeInfo = cur
                 found.getBoundsInScreen(b)
                 if (b.height() >= screen.height() * 0.2f && b.width() <= screen.width() * 0.9f) {
-                    out.getOrPut(found) { Card(found, 0f, null, app.labels.first(), found.drawingOrder) }
+                    out.getOrPut(found) { Card(found, 0f, null, app.labels.first(), found.drawingOrder, Rect(b), null) }
                     break
                 }
                 cur = try { cur.parent } catch (_: Exception) { null }
