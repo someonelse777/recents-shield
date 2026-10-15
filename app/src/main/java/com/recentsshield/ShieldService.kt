@@ -58,9 +58,6 @@ class ShieldService : AccessibilityService() {
     @Volatile private var armedUntil = 0L    // after a Recents tap, keep trying while Recents opens
 
     // Main-thread state
-    private var suppressUntil = 0L           // just after leaving Recents, ignore stale scans
-    private var activeSince = 0L
-    private var lastLeaveAt = -VERIFY_MS
     private var misses = 0
     private var lastIdleScan = 0L
     private var lastActiveScanRequest = 0L
@@ -131,26 +128,13 @@ class ShieldService : AccessibilityService() {
         val pkg = e.packageName?.toString() ?: return
         val now = SystemClock.uptimeMillis()
 
+        // Events only tell us *when* to look. What's actually on screen (checked by a scan)
+        // decides whether the shield is on: signals can arrive late or out of order.
+
         if (e.eventType == AccessibilityEvent.TYPE_VIEW_CLICKED && pkg == SYSTEM_UI) {
-            when (navButton(e)) {
-                NavButton.RECENTS -> {
-                    scanHandler.postDelayed({ writeDiagnostics() }, DIAG_DELAY_MS)
-                    if (active) {
-                        // Recents pressed inside Recents jumps back to the last app. But the
-                        // "button tapped" signal sometimes arrives just AFTER Recents has been
-                        // detected; that's the same tap that opened it, not a second one.
-                        if (now - activeSince > TOGGLE_GUARD_MS) leaveRecents(now, "Recents pressed again")
-                    } else if (hiddenNow().isNotEmpty()) {
-                        armedUntil = now + ARMED_MS
-                        suppressUntil = 0
-                        requestScan()
-                        startPeriodicScans()
-                    }
-                }
-                NavButton.HOME -> if (active || now < armedUntil) leaveRecents(now, "Home pressed")
-                NavButton.BACK -> if (active || now < armedUntil) leaveRecents(now, "Back pressed")
-                null -> Unit
-            }
+            val button = navButton(e) ?: return
+            if (button == NavButton.RECENTS) scanHandler.postDelayed({ writeDiagnostics() }, DIAG_DELAY_MS)
+            if (hiddenNow().isNotEmpty() || active) lookCloselyFor(now)
             return
         }
 
@@ -162,20 +146,24 @@ class ShieldService : AccessibilityService() {
                 }
             } else if (now - lastIdleScan > IDLE_SCAN_MS && hiddenNow().isNotEmpty()) {
                 lastIdleScan = now
-                requestScan()
+                lookCloselyFor(now)
             }
             return
         }
 
-        // Only a real app window coming to the front means "an app was opened from Recents".
-        // Keyboards, popups, edge panels and toasts also send window events and used to
-        // cancel the shield by mistake.
+        // Another app's window changed while Recents is (or may be) up: check what's in front.
         if (e.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED &&
-            pkg != SYSTEM_UI && pkg != packageName && (active || now < armedUntil) &&
-            isFrontAppWindow(e.windowId)
+            pkg != SYSTEM_UI && pkg != packageName && (active || now < armedUntil)
         ) {
-            leaveRecents(now, "app opened: $pkg")
+            lookCloselyFor(now)
         }
+    }
+
+    /** Scan right away and then every 30 ms for a little while. */
+    private fun lookCloselyFor(now: Long) {
+        armedUntil = now + ARMED_MS
+        requestScan()
+        startPeriodicScans()
     }
 
     private enum class NavButton { RECENTS, HOME, BACK }
@@ -196,45 +184,53 @@ class ShieldService : AccessibilityService() {
         }
     }
 
-    private fun isFrontAppWindow(windowId: Int): Boolean = try {
-        windows.firstOrNull { it.id == windowId }?.let {
-            it.type == AccessibilityWindowInfo.TYPE_APPLICATION && (it.isActive || it.isFocused)
-        } ?: false
-    } catch (_: Exception) { false }
-
-    /**
-     * Turn the shield off. If that was a misjudgement and Recents is in fact still showing,
-     * the follow-up scans over the next moment turn it back on.
-     */
-    private fun leaveRecents(now: Long, reason: String) {
-        if (active) Diag.log(this, "Shield off: $reason")
-        goIdle()
-        suppressUntil = now + SUPPRESS_MS
-        lastLeaveAt = now
-        armedUntil = now + VERIFY_MS
-        startPeriodicScans()
-    }
-
     // ---------------------------------------------------------------- scanning (background)
+
+    /** What a scan saw. [appInFront] is set when a regular app window has input focus. */
+    private class ScanOut(val result: RecentsScanner.Result?, val appInFront: String?)
 
     private fun requestScan() {
         if (!scanQueued.compareAndSet(false, true)) return
         val posted = scanHandler.post {
             scanQueued.set(false)
-            var focused = false
-            val result = try {
-                findHomeRoot()?.let { (root, f) ->
-                    focused = f
-                    RecentsScanner.scan(root, hiddenNow())
-                }
+            val out = try {
+                scanScreen()
             } catch (t: Throwable) {
                 logError("scan", t)
-                null
+                ScanOut(null, null)
             }
-            val homeFocused = focused
-            main.post { guarded("applyScan") { applyScan(result, homeFocused) } }
+            main.post { guarded("applyScan") { applyScan(out) } }
         }
         if (!posted) scanQueued.set(false)
+    }
+
+    private fun scanScreen(): ScanOut {
+        val hidden = hiddenNow()
+        var appInFront: String? = null
+        val homeRoots = ArrayList<Pair<AccessibilityNodeInfo, Boolean>>()
+        try {
+            for (w in windows) {
+                val root = w.root ?: continue
+                val pkg = root.packageName?.toString() ?: continue
+                if (pkg in homePackages) {
+                    homeRoots.add(root to w.isFocused)
+                } else if (w.type == AccessibilityWindowInfo.TYPE_APPLICATION && w.isFocused && pkg != packageName) {
+                    appInFront = pkg
+                }
+            }
+        } catch (_: Exception) {}
+        if (homeRoots.isEmpty()) {
+            val r = try { rootInActiveWindow } catch (_: Exception) { null }
+            if (r != null && r.packageName?.toString()?.let { it in homePackages } == true) homeRoots.add(r to true)
+        }
+        // Check the focused home window first; use whichever one shows Recents.
+        var result: RecentsScanner.Result? = null
+        for ((root, _) in homeRoots.sortedByDescending { it.second }) {
+            val r = RecentsScanner.scan(root, hidden)
+            if (r.isRecents) { result = r; break }
+            if (result == null) result = r
+        }
+        return ScanOut(result, appInFront)
     }
 
     private val periodicScan = object : Runnable {
@@ -251,25 +247,30 @@ class ShieldService : AccessibilityService() {
         scanHandler.postDelayed(periodicScan, FAST_SCAN_MS)
     }
 
-    private fun applyScan(result: RecentsScanner.Result?, homeFocused: Boolean) {
+    private fun applyScan(out: ScanOut) {
         val now = SystemClock.uptimeMillis()
-        if (result != null && result.isRecents) {
-            if (now < suppressUntil) return
-            // Right after leaving, only come back if Recents is really in front (not an app
-            // that's still animating open over it).
-            if (!active && now - lastLeaveAt < VERIFY_MS && !homeFocused) return
+        val result = out.result
+        val recentsUp = result != null && result.isRecents && out.appInFront == null
+        if (recentsUp) {
             misses = 0
-            cards = result.cards
+            cards = result!!.cards
             if (!active) {
                 active = true
-                activeSince = now
-                if (now - lastLeaveAt < VERIFY_MS) Diag.log(this, "Shield back on (Recents was still showing)")
+                Diag.log(this, "Shield on")
                 startPeriodicScans()
                 Choreographer.getInstance().postFrameCallback(frame)
             }
             return
         }
-        if (active && now >= armedUntil && ++misses >= 2) {
+        if (!active) return
+        if (out.appInFront != null) {
+            Diag.log(this, "Shield off: ${out.appInFront} is in front")
+            goIdle()
+            return
+        }
+        // Recents not seen. While looking closely (just after a button press) one miss is
+        // enough; otherwise wait for two in a row so a single odd read doesn't flicker it.
+        if (++misses >= (if (now < armedUntil) 1 else 2)) {
             Diag.log(this, "Shield off: Recents no longer showing")
             goIdle()
         }
@@ -280,7 +281,7 @@ class ShieldService : AccessibilityService() {
         misses = 0
         cards = emptyList()
         motion.clear()
-        scanHandler.removeCallbacks(periodicScan)
+        // Periodic scans stop by themselves once the close-look window is over.
         Choreographer.getInstance().removeFrameCallback(frame)
         overlay.hide()
     }
@@ -419,7 +420,15 @@ class ShieldService : AccessibilityService() {
             val version = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (_: Exception) { "?" }
             val header = buildString {
                 append("Version: $version\n")
+                append("Shield active: $active\n")
                 append("Recents recognised: ${r.isRecents}\n")
+                append("Windows (front to back):\n")
+                try {
+                    for (w in windows) {
+                        val wp = try { w.root?.packageName } catch (_: Exception) { null }
+                        append("  type=${w.type} pkg=$wp focused=${w.isFocused} active=${w.isActive} layer=${w.layer}\n")
+                    }
+                } catch (_: Exception) {}
                 append("Hidden now: ${hidden.joinToString { "${it.pkg} ${it.labels}" }}\n")
                 append("Always: $always\n")
                 append("Schedules: ${schedules.joinToString { "${it.name} on=${it.enabled} days=${it.days} ${it.startMin}-${it.endMin} apps=${it.apps}" }}\n")
@@ -477,9 +486,6 @@ class ShieldService : AccessibilityService() {
         private const val ACTIVE_EVENT_SCAN_MS = 60L
         private const val IDLE_SCAN_MS = 150L
         private const val ARMED_MS = 1200L
-        private const val SUPPRESS_MS = 400L
-        private const val VERIFY_MS = 1500L         // after turning off, keep checking this long
-        private const val TOGGLE_GUARD_MS = 500L
         private const val LEAD_MS = 16L             // how far ahead to predict scrolling
         private const val DIAG_DELAY_MS = 700L
     }
