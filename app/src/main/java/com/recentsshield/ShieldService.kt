@@ -79,11 +79,13 @@ class ShieldService : AccessibilityService() {
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == Prefs.KEY_HIDDEN || key == Schedules.KEY) worker.post { loadSettings() }
+        if (key in Prefs.DRAWING_KEYS) main.post { if (::overlay.isInitialized) guarded("configure") { overlay.configure() } }
     }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         overlay = ShieldOverlay(this, getSystemService(WINDOW_SERVICE) as WindowManager)
+        overlay.configure() // in the default mode this puts the (empty) window up now, before any Recents animation
         prefs = Prefs.get(this)
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         homePackages = findHomePackages()
@@ -361,7 +363,7 @@ class ShieldService : AccessibilityService() {
     private fun startDrawing() {
         if (drawing) return
         drawing = true
-        if (prefs.getBoolean(Prefs.KEY_DEBUG_OUTLINE, false)) overlay.ensureAttached()
+        overlay.setActive(true)
         Choreographer.getInstance().postFrameCallback(frame)
     }
 
@@ -497,7 +499,12 @@ class ShieldService : AccessibilityService() {
         worker.removeCallbacksAndMessages(null)
         active = false
         snapshot = null
-        main.post { if (::overlay.isInitialized) stopDrawing() }
+        main.post {
+            if (::overlay.isInitialized) {
+                stopDrawing()
+                overlay.detach()
+            }
+        }
         if (::prefs.isInitialized) prefs.unregisterOnSharedPreferenceChangeListener(prefListener)
     }
 

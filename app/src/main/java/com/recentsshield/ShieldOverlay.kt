@@ -9,6 +9,7 @@ import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Build
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.View
 import android.view.WindowManager
@@ -18,98 +19,166 @@ import android.view.WindowManager
  * it (cards stacked in front, and app badges), which are cut out of the black so they
  * stay visible.
  */
-class Shield(val box: Rect, val cutouts: List<Rect>, val cutoutIsIcon: List<Boolean>)
+data class Shield(val box: Rect, val cutouts: List<Rect>, val cutoutIsIcon: List<Boolean>)
 
 /**
- * A see-through, untouchable window drawn above everything (including Recents).
- * Touches pass straight through to the cards underneath.
+ * A see-through, untouchable full-screen window above everything. Touches pass straight
+ * through to whatever is underneath.
+ *
+ * By default the window is created once and stays up permanently (empty when there's
+ * nothing to hide). A window created *during* Samsung's Recents animation gets swept into
+ * that animation, and Android holds back its updates until Recents closes, so the box
+ * never appears. A window that already exists isn't affected.
+ *
+ * Two experimental drawing methods can be switched on from Troubleshooting.
  */
 class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
 
     private var view: ShieldView? = null
+    private var lp: WindowManager.LayoutParams? = null
+
+    private var persistent = true
+    private var nudge = false
+    private var software = false
+    private var debug = false
 
     // Diagnostics: what the window is actually doing.
     @Volatile var adds = 0
         private set
     @Volatile var lastAddError: String? = null
         private set
-    @Volatile private var lastView: ShieldView? = null
 
     fun stats(): String {
-        val v = lastView
-        return "window adds=$adds" + (lastAddError?.let { ", add error=$it" } ?: "") +
-            (v?.let { ", draws=${it.draws}, painted boxes=${it.paintedBoxes}, attached=${it.isAttachedToWindow}, " +
-                "visibility=${it.windowVisibilityText}, size=${it.width}x${it.height}, at=${it.lastLoc}" } ?: ", no window yet")
+        val v = view
+        val mode = buildList {
+            if (persistent) add("always-up")
+            if (nudge) add("nudge")
+            if (software) add("no-GPU")
+        }.joinToString("+").ifEmpty { "on-demand" }
+        return "window mode=$mode, adds=$adds" + (lastAddError?.let { ", add error=$it" } ?: "") +
+            (v?.let { ", draws=${it.draws}, painted boxes=${it.paintedBoxes}, " +
+                "visibility=${it.windowVisibilityText}, size=${it.width}x${it.height}" } ?: ", no window now")
+    }
+
+    /** (Re)read the drawing settings and set the window up accordingly. Main thread. */
+    fun configure() {
+        val p = Prefs.get(ctx)
+        persistent = p.getBoolean(Prefs.KEY_PERSISTENT_WINDOW, true)
+        nudge = p.getBoolean(Prefs.KEY_NUDGE, false)
+        software = p.getBoolean(Prefs.KEY_SOFTWARE, false)
+        debug = p.getBoolean(Prefs.KEY_DEBUG_OUTLINE, false)
+        detach()
+        if (persistent) attach()
+    }
+
+    /** The shield is on (Recents showing): only affects the debug markers. */
+    fun setActive(active: Boolean) {
+        if (active && debug) attach()
+        view?.setActive(active)
     }
 
     fun show(shields: List<Shield>) {
-        // Nothing to draw and nothing showing: don't create a window at all.
         if (shields.isEmpty() && view == null) return
         val v = attach() ?: return
-        v.setShields(shields)
+        if (v.setShields(shields) && nudge) nudgeWindow()
     }
 
-    /** Put the window up even with nothing to draw (used by the debug red border). */
-    fun ensureAttached() {
-        attach()
-    }
-
+    /** Clear the boxes. In always-up mode the (empty) window stays. */
     fun hide() {
         val v = view ?: return
+        v.setActive(false)
+        if (persistent) {
+            if (v.setShields(emptyList()) && nudge) nudgeWindow()
+        } else {
+            detach()
+        }
+    }
+
+    fun detach() {
+        val v = view ?: return
         view = null
+        lp = null
         try { wm.removeViewImmediate(v) } catch (_: Exception) {}
+    }
+
+    /**
+     * Experimental: make the window manager re-apply this window after each change, by
+     * flipping its opacity between 100% and 99.9% (not visible to the eye).
+     */
+    private var nudgeFlip = false
+
+    private fun nudgeWindow() {
+        val v = view ?: return
+        val p = lp ?: return
+        nudgeFlip = !nudgeFlip
+        p.alpha = if (nudgeFlip) 0.999f else 1f
+        try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
     }
 
     private var lastFailure = 0L
 
     private fun attach(): ShieldView? {
         view?.let { return it }
-        val v = ShieldView(ctx, Prefs.get(ctx).getBoolean(Prefs.KEY_DEBUG_OUTLINE, false))
-        val lp = WindowManager.LayoutParams(
+        val v = ShieldView(ctx, debug)
+        var flags = WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+            WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+            WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+            WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+        if (!software) flags = flags or WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+        val p = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
-                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
-                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+            flags,
             PixelFormat.TRANSLUCENT,
         )
-        lp.gravity = Gravity.TOP or Gravity.START
-        lp.windowAnimations = 0
-        lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            lp.fitInsetsTypes = 0
-        }
+        p.gravity = Gravity.TOP or Gravity.START
+        p.windowAnimations = 0
+        p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) p.fitInsetsTypes = 0
+        if (software) v.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
         return try {
-            wm.addView(v, lp)
+            wm.addView(v, p)
             view = v
-            lastView = v
+            lp = p
             adds++
             v
         } catch (e: Exception) {
             lastAddError = "${e.javaClass.simpleName}: ${e.message}"
             // Android can briefly refuse the overlay (e.g. while the service reconnects).
-            // That used to crash the service; now we skip this frame and try again.
-            val now = android.os.SystemClock.uptimeMillis()
-            if (now - lastFailure > 10_000) Diag.log(ctx, "Overlay couldn't be shown: ${e.javaClass.simpleName}: ${e.message}")
+            val now = SystemClock.uptimeMillis()
+            if (now - lastFailure > 10_000) Diag.log(ctx, "Overlay couldn't be shown: $lastAddError")
             lastFailure = now
             null
         }
     }
 }
 
-private class ShieldView(ctx: Context, private val debugOutline: Boolean) : View(ctx) {
+private class ShieldView(ctx: Context, private val debug: Boolean) : View(ctx) {
     @Volatile var draws = 0
     @Volatile var paintedBoxes = 0
-    @Volatile var lastLoc = "?"
     @Volatile var windowVisibilityText = "unknown"
+
+    private var active = false
+    private var shields: List<Shield> = emptyList()
+
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.BLACK
+        style = Paint.Style.FILL
+    }
+    private val density = ctx.resources.displayMetrics.density
+    private val cardRadius = 22f * density
     private val debugPaint = Paint().apply {
         color = Color.RED
         style = Paint.Style.STROKE
-        strokeWidth = 8f * ctx.resources.displayMetrics.density
+        strokeWidth = 8f * density
     }
+    private val blinkPaint = Paint().apply { style = Paint.Style.FILL }
+    private val debugMargin = 14f * density
+    private val loc = IntArray(2)
+    private val boxPath = Path()
+    private val cutPath = Path()
+    private val rf = RectF()
 
     override fun onWindowVisibilityChanged(visibility: Int) {
         super.onWindowVisibilityChanged(visibility)
@@ -121,50 +190,43 @@ private class ShieldView(ctx: Context, private val debugOutline: Boolean) : View
         }
     }
 
-    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.BLACK
-        style = Paint.Style.FILL
+    fun setActive(a: Boolean) {
+        if (active == a) return
+        active = a
+        if (debug) invalidate()
     }
-    private val cardRadius = 22f * ctx.resources.displayMetrics.density
-    private var shields: List<Shield> = emptyList()
-    private val loc = IntArray(2)
-    private val boxPath = Path()
-    private val cutPath = Path()
-    private val rf = RectF()
 
-    fun setShields(s: List<Shield>) {
-        if (s.isEmpty() && shields.isEmpty()) return
+    /** Returns true if anything changed (and a redraw was requested). */
+    fun setShields(s: List<Shield>): Boolean {
+        if (s == shields) return false // nothing moved: don't produce a new frame
         shields = s
         invalidate()
+        return true
     }
-
-    private val blinkPaint = Paint().apply { style = Paint.Style.FILL }
-    private val debugMargin = 14f * ctx.resources.displayMetrics.density
 
     override fun onDraw(canvas: Canvas) {
         draws++
-        if (debugOutline) {
+        val showDebug = debug && active
+        if (showDebug) {
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), debugPaint)
             // Blinks red/green twice a second: if it keeps blinking, this window is updating.
-            val phase = (android.os.SystemClock.uptimeMillis() / 500) % 2 == 0L
+            val phase = (SystemClock.uptimeMillis() / 500) % 2 == 0L
             blinkPaint.color = if (phase) Color.RED else Color.GREEN
-            val sq = 36f * resources.displayMetrics.density
+            val sq = 36f * density
             canvas.drawRect(sq * 0.6f, sq * 2.5f, sq * 1.6f, sq * 3.5f, blinkPaint)
-            postInvalidateOnAnimation() // keep blinking even with nothing else changing
+            postInvalidateOnAnimation()
         }
         if (shields.isEmpty()) return
         paintedBoxes += shields.size
         getLocationOnScreen(loc)
-        lastLoc = "${loc[0]},${loc[1]}"
         val ox = loc[0].toFloat()
         val oy = loc[1].toFloat()
-        // Screen edges, in screen coordinates.
         val left = ox
         val right = ox + width
         for (s in shields) {
             boxPath.reset()
             toRectF(s.box, ox, oy, left, right, cardRadius)
-            if (debugOutline) rf.inset(-debugMargin, -debugMargin)
+            if (showDebug) rf.inset(-debugMargin, -debugMargin)
             boxPath.addRoundRect(rf, cardRadius, cardRadius, Path.Direction.CW)
             for (i in s.cutouts.indices) {
                 val r = s.cutouts[i]

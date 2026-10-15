@@ -122,13 +122,15 @@ class MainActivity : Activity() {
 
         // Troubleshooting
         root.addView(sectionTitle("Troubleshooting"))
-        root.addView(android.widget.CheckBox(this).apply {
-            text = "Debug: red border on screen while the shield's window is up"
-            isChecked = Prefs.get(this@MainActivity).getBoolean(Prefs.KEY_DEBUG_OUTLINE, false)
-            setOnCheckedChangeListener { _, on ->
-                Prefs.get(this@MainActivity).edit().putBoolean(Prefs.KEY_DEBUG_OUTLINE, on).apply()
-            }
-        })
+        fun toggle(label: String, key: String, default: Boolean) = android.widget.CheckBox(this).apply {
+            text = label
+            isChecked = Prefs.get(this@MainActivity).getBoolean(key, default)
+            setOnCheckedChangeListener { _, on -> Prefs.get(this@MainActivity).edit().putBoolean(key, on).apply() }
+        }
+        root.addView(toggle("Keep the shield's window up all the time (recommended)", Prefs.KEY_PERSISTENT_WINDOW, true))
+        root.addView(toggle("Experiment: nudge the window after each change", Prefs.KEY_NUDGE, false))
+        root.addView(toggle("Experiment: draw without the GPU", Prefs.KEY_SOFTWARE, false))
+        root.addView(toggle("Debug: red border and blinking square while the shield is on", Prefs.KEY_DEBUG_OUTLINE, false))
 
         setContentView(ScrollView(this).apply { addView(root) })
     }

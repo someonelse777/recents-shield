@@ -9,6 +9,10 @@ object Prefs {
     const val KEY_HIDDEN = "hidden_packages"
     const val KEY_SUMMARY = "last_summary"
     const val KEY_DEBUG_OUTLINE = "debug_outline"
+    const val KEY_PERSISTENT_WINDOW = "persistent_window"
+    const val KEY_NUDGE = "nudge_window"
+    const val KEY_SOFTWARE = "software_draw"
+    val DRAWING_KEYS = setOf(KEY_DEBUG_OUTLINE, KEY_PERSISTENT_WINDOW, KEY_NUDGE, KEY_SOFTWARE)
     private const val DUMP_FILE = "last_recents_dump.txt"
 
     fun get(c: Context): SharedPreferences = c.getSharedPreferences(NAME, Context.MODE_PRIVATE)
