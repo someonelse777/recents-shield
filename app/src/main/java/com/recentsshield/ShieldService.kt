@@ -265,15 +265,22 @@ class ShieldService : AccessibilityService() {
         if (!active) return
         if (out.appInFront != null) {
             Diag.log(this, "Shield off: ${out.appInFront} is in front")
-            goIdle()
+            turnOff(now)
             return
         }
-        // Recents not seen. While looking closely (just after a button press) one miss is
-        // enough; otherwise wait for two in a row so a single odd read doesn't flicker it.
-        if (++misses >= (if (now < armedUntil) 1 else 2)) {
-            Diag.log(this, "Shield off: Recents no longer showing")
-            goIdle()
+        // Recents not seen. A single read can come back wrong, so it takes three in a row.
+        if (++misses >= 3) {
+            val why = if (result == null) "couldn't read the screen" else "no Recents cards found"
+            Diag.log(this, "Shield off: Recents no longer showing ($why)")
+            turnOff(now)
         }
+    }
+
+    /** Switch off, but keep checking for a moment: if that was a misread, it comes straight back on. */
+    private fun turnOff(now: Long) {
+        goIdle()
+        armedUntil = now + RECHECK_AFTER_OFF_MS
+        startPeriodicScans()
     }
 
     private fun goIdle() {
@@ -486,6 +493,7 @@ class ShieldService : AccessibilityService() {
         private const val ACTIVE_EVENT_SCAN_MS = 60L
         private const val IDLE_SCAN_MS = 150L
         private const val ARMED_MS = 1200L
+        private const val RECHECK_AFTER_OFF_MS = 1500L
         private const val LEAD_MS = 16L             // how far ahead to predict scrolling
         private const val DIAG_DELAY_MS = 700L
     }
