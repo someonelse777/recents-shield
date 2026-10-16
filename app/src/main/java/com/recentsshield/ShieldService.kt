@@ -76,6 +76,7 @@ class ShieldService : AccessibilityService() {
     // ---- main-thread state
     private var drawing = false
     private var lastHomeEvent = 0L
+    private var blackoutUntil = 0L
 
     private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
         if (key == Prefs.KEY_HIDDEN || key == Schedules.KEY) worker.post { loadSettings() }
@@ -149,6 +150,7 @@ class ShieldService : AccessibilityService() {
             return
         }
         if (pkg in homePackages) {
+            if (type == AccessibilityEvent.TYPE_VIEW_CLICKED && active) onRecentsTap(e)
             // While on: refresh the card list soon. While off: one quick check (in case Recents
             // was opened some other way), throttled so a busy home screen costs little.
             val interval = if (active) HOME_EVENT_MS else IDLE_HOME_EVENT_MS
@@ -165,6 +167,67 @@ class ShieldService : AccessibilityService() {
         if (type == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED && pkg != SYSTEM_UI && pkg != packageName) {
             worker.post { guarded("window") { if (active || SystemClock.uptimeMillis() < armedUntil) arm() } }
         }
+    }
+
+    /**
+     * Something on the Recents screen was tapped. If it's a hidden app's card, black the
+     * screen out right away, before the app even starts to open.
+     */
+    private fun onRecentsTap(e: AccessibilityEvent) {
+        val hidden = hiddenNow()
+        if (hidden.isEmpty() || Prefs.get(this).getInt(Prefs.KEY_BLACKOUT_MS, Prefs.DEFAULT_BLACKOUT_MS) <= 0) return
+        val label = (e.contentDescription ?: e.text.joinToString(" ")).toString().trim()
+        if (label.isNotEmpty()) {
+            if (RecentsScanner.isHidden(label, hidden)) startBlackout("tapped $label in Recents")
+            return
+        }
+        // The tap was on a part of the card with no name (e.g. the preview). Look at what was
+        // tapped on the worker thread: asking the home app about it can take a moment.
+        @Suppress("DEPRECATION")
+        val copy = AccessibilityEvent.obtain(e)
+        worker.post {
+            guarded("tap") {
+                val name = tappedCardName(copy)
+                if (name != null && RecentsScanner.isHidden(name, hiddenNow())) {
+                    main.post { startBlackout("tapped $name in Recents") }
+                }
+            }
+        }
+    }
+
+    /** The app name of the card that was tapped, or null. Worker thread. */
+    private fun tappedCardName(e: AccessibilityEvent): String? {
+        var n: AccessibilityNodeInfo? = try { e.source } catch (_: Exception) { null } ?: return null
+        // The badge opens a menu, not the app.
+        if (n?.viewIdResourceName?.endsWith("/task_icon") == true) return null
+        var depth = 0
+        while (n != null && depth < 4) {
+            val name = RecentsScanner.labelOf(n)
+            if (name.isNotEmpty()) return name
+            n = try { n.parent } catch (_: Exception) { null }
+            depth++
+        }
+        return null
+    }
+
+    // ---------------------------------------------------------------- blackout (main thread)
+
+    private val endBlackout = Runnable {
+        blackoutUntil = 0L
+        guarded("blackout end") { overlay.blackout(false) }
+    }
+
+    /** Black the whole screen out for the chosen time. Main thread. */
+    private fun startBlackout(reason: String) {
+        val ms = Prefs.get(this).getInt(Prefs.KEY_BLACKOUT_MS, Prefs.DEFAULT_BLACKOUT_MS)
+        if (ms <= 0) return
+        val now = SystemClock.uptimeMillis()
+        if (now < blackoutUntil) return // already blacked out for this opening
+        blackoutUntil = now + ms
+        overlay.blackout(true)
+        main.removeCallbacks(endBlackout)
+        main.postDelayed(endBlackout, ms.toLong())
+        Diag.log(this, "Blackout ${ms} ms: $reason")
     }
 
     // ---------------------------------------------------------------- worker thread
@@ -205,7 +268,11 @@ class ShieldService : AccessibilityService() {
         // 1) Is a regular app in front? Then Recents isn't showing.
         val front = frontApp(ws)
         if (front != null) {
-            if (active) turnOff(now, "$front is in front")
+            if (active) {
+                // Opened from Recents (a card tap we missed, or Recents pressed again to go back).
+                if (hidden.any { it.pkg == front }) main.post { guarded("blackout") { startBlackout("opened $front from Recents") } }
+                turnOff(now, "$front is in front")
+            }
             return
         }
 
@@ -500,8 +567,11 @@ class ShieldService : AccessibilityService() {
         active = false
         snapshot = null
         main.post {
+            main.removeCallbacks(endBlackout)
+            blackoutUntil = 0L
             if (::overlay.isInitialized) {
                 stopDrawing()
+                overlay.blackout(false)
                 overlay.detach()
             }
         }

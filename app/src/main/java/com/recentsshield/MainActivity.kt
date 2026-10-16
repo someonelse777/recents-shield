@@ -24,6 +24,8 @@ class MainActivity : Activity() {
 
     companion object {
         private const val REQ_ALWAYS = 1
+        private const val BLACKOUT_STEP_MS = 250
+        private const val BLACKOUT_STEPS = 20
     }
 
     private lateinit var status: TextView
@@ -118,6 +120,37 @@ class MainActivity : Activity() {
         root.addView(Button(this).apply {
             text = "+ Add schedule"
             setOnClickListener { startActivity(ScheduleActivity.intent(this@MainActivity, null)) }
+        })
+
+        // Blackout when opening a hidden app from Recents
+        root.addView(sectionTitle("Opening a hidden app from Recents"))
+        root.addView(TextView(this).apply {
+            text = "Black out the screen for a moment when you open a hidden app from Recents. " +
+                "Opening it from the home screen or anywhere else isn't affected."
+            textSize = 13f
+            alpha = 0.75f
+        })
+        val blackoutLabel = TextView(this).apply {
+            textSize = 15f
+            setPadding(0, px(8), 0, 0)
+        }
+        fun blackoutText(ms: Int) =
+            if (ms <= 0) "Black screen: off" else "Black screen for " + String.format(java.util.Locale.US, "%.2f", ms / 1000f).trimEnd('0').trimEnd('.') + " s"
+        val currentMs = Prefs.get(this).getInt(Prefs.KEY_BLACKOUT_MS, Prefs.DEFAULT_BLACKOUT_MS)
+        blackoutLabel.text = blackoutText(currentMs)
+        root.addView(blackoutLabel)
+        root.addView(android.widget.SeekBar(this).apply {
+            max = BLACKOUT_STEPS // 0 … 5 s in quarter-second steps
+            progress = (currentMs / BLACKOUT_STEP_MS).coerceIn(0, BLACKOUT_STEPS)
+            setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(sb: android.widget.SeekBar?, p: Int, fromUser: Boolean) {
+                    val ms = p * BLACKOUT_STEP_MS
+                    blackoutLabel.text = blackoutText(ms)
+                    if (fromUser) Prefs.get(this@MainActivity).edit().putInt(Prefs.KEY_BLACKOUT_MS, ms).apply()
+                }
+                override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+                override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {}
+            })
         })
 
         // Troubleshooting

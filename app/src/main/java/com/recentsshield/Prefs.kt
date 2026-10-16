@@ -12,6 +12,9 @@ object Prefs {
     const val KEY_PERSISTENT_WINDOW = "persistent_window"
     const val KEY_NUDGE = "nudge_window"
     const val KEY_SOFTWARE = "software_draw"
+    /** How long the screen stays black when a hidden app is opened from Recents (ms, 0 = off). */
+    const val KEY_BLACKOUT_MS = "blackout_ms"
+    const val DEFAULT_BLACKOUT_MS = 1000
     val DRAWING_KEYS = setOf(KEY_DEBUG_OUTLINE, KEY_PERSISTENT_WINDOW, KEY_NUDGE, KEY_SOFTWARE)
     private const val DUMP_FILE = "last_recents_dump.txt"
 

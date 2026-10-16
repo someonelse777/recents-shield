@@ -12,6 +12,8 @@ Blacks out the Recents (Overview) previews of the apps you choose, on Samsung On
 - App badges, and cards stacked in front of a hidden card, are cut out of the black so
   they stay visible.
 - When you open an app or leave Recents, the overlay disappears.
+- Optionally, opening a hidden app *from Recents* blacks out the whole screen for a moment
+  (default 1 s, adjustable 0–5 s in the app). Opening it any other way isn't affected.
 
 The boxes are see-through to touches, so tapping a blacked-out card still opens that app.
 

@@ -36,6 +36,7 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
 
     private var view: ShieldView? = null
     private var lp: WindowManager.LayoutParams? = null
+    private var blackingOut = false
 
     private var persistent = true
     private var nudge = false
@@ -83,11 +84,24 @@ class ShieldOverlay(private val ctx: Context, private val wm: WindowManager) {
         if (v.setShields(shields) && nudge) nudgeWindow()
     }
 
-    /** Clear the boxes. In always-up mode the (empty) window stays. */
+    /** Cover the whole screen in black (on) or go back to normal (off). */
+    fun blackout(on: Boolean) {
+        blackingOut = on
+        if (on) {
+            val v = attach() ?: return
+            if (v.setFullBlack(true) && nudge) nudgeWindow()
+        } else {
+            val v = view ?: return
+            if (v.setFullBlack(false) && nudge) nudgeWindow()
+            if (!persistent && !v.hasShields()) detach()
+        }
+    }
+
+    /** Clear the boxes. In always-up mode (or during a blackout) the window stays. */
     fun hide() {
         val v = view ?: return
         v.setActive(false)
-        if (persistent) {
+        if (persistent || blackingOut) {
             if (v.setShields(emptyList()) && nudge) nudgeWindow()
         } else {
             detach()
@@ -160,7 +174,18 @@ private class ShieldView(ctx: Context, private val debug: Boolean) : View(ctx) {
     @Volatile var windowVisibilityText = "unknown"
 
     private var active = false
+    private var fullBlack = false
     private var shields: List<Shield> = emptyList()
+
+    fun hasShields() = shields.isNotEmpty()
+
+    /** Returns true if it changed (and a redraw was requested). */
+    fun setFullBlack(on: Boolean): Boolean {
+        if (fullBlack == on) return false
+        fullBlack = on
+        invalidate()
+        return true
+    }
 
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.BLACK
@@ -206,6 +231,10 @@ private class ShieldView(ctx: Context, private val debug: Boolean) : View(ctx) {
 
     override fun onDraw(canvas: Canvas) {
         draws++
+        if (fullBlack) {
+            canvas.drawColor(Color.BLACK)
+            return
+        }
         val showDebug = debug && active
         if (showDebug) {
             canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), debugPaint)
